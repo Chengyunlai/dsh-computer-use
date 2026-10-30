@@ -19,9 +19,9 @@
 
 ## macOS 桌面驱动（真实鼠标 · 系统理解）
 
-除了浏览器，`computer_use` 还能以 **desktop** 模式驱动 macOS 桌面：整屏截图、通过辅助功能 API 读取**应用/窗口/元素状态**、启动并激活应用。**默认后台模式**：用 AX 动作操作目标应用，**不移动你的真实鼠标、不抢键盘焦点**（可选 `inputMode: global` 切换为真实 CGEvent 鼠标）。演示（后台操作计算器，`7 + 3 =`，全程真实鼠标不动）：
+除了浏览器，`computer_use` 还能以 **desktop** 模式驱动 macOS 桌面：整屏截图、通过辅助功能 API 读取**应用/窗口/元素状态**、启动并激活应用。**默认后台模式**：用 AX 动作操作目标应用，**不移动你的真实鼠标、不抢键盘焦点**（可选 `inputMode: global` 切换为真实 CGEvent 鼠标）。
 
-![桌面演示](docs/demos/desktop-calculator.gif)
+**桌面演示**：后台操作计算器 `7 + 3 =` 全程真实鼠标不动、焦点不抢——由 `test/driver.desktop.e2e.mjs` 全自动验证（`ALL PASS`）。说明：桌面操作会截到整屏内容，出于隐私保护，本仓库**不提供桌面演示 GIF**；如需自行录制，用 `scripts/record-demo-desktop.mjs` 在干净屏幕上执行。
 
 实现：原生 Swift helper（`native/macos-helper.swift`），编译：
 

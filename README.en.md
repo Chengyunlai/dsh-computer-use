@@ -20,9 +20,9 @@ GIFs of three real-world scenarios, all recorded by the plugin's own driver (the
 
 ## macOS desktop driver (real mouse · system understanding)
 
-Besides the browser, `computer_use` can drive the macOS desktop in **desktop** mode: full-screen captures, app/window/element state via the Accessibility API, and launching/activating apps. **Background mode by default**: the target app is operated through AX actions — your real mouse never moves and keyboard focus is not stolen (switch with `inputMode: global` to real CGEvent input). Demo (operating the Calculator in the background, `7 + 3 =`, real mouse untouched):
+Besides the browser, `computer_use` can drive the macOS desktop in **desktop** mode: full-screen captures, app/window/element state via the Accessibility API, and launching/activating apps. **Background mode by default**: the target app is operated through AX actions — your real mouse never moves and keyboard focus is not stolen (switch with `inputMode: global` to real CGEvent input).
 
-![desktop demo](docs/demos/desktop-calculator.gif)
+**Desktop demo**: operating the Calculator in the background (`7 + 3 =`) with the real mouse untouched and focus never stolen — verified end to end by `test/driver.desktop.e2e.mjs` (ALL PASS). Note: desktop operation captures the full screen, so for privacy this repo intentionally ships **no desktop demo GIF**; record your own with `scripts/record-demo-desktop.mjs` on a clean screen.
 
 Implementation: a native Swift helper (`native/macos-helper.swift`); build with:
 
