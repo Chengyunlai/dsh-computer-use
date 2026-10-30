@@ -8,9 +8,11 @@
 
 一个 Cordis 插件，为 DeepSeek Harness 的 Agent 提供 `computer_use` 工具：截取当前视图、按像素坐标点击、输入文本、按键、滚动、读取可交互页面状态。Agent 自主完成 **观察 → 决策 → 操作 → 验证** 的完整闭环——不需要 PyAutoGUI，也不需要预先写死的坐标。
 
-| 初始页面 | 展开并输入 | 保存结果 |
+| 初始视口 | 点击关闭 Cookie 横幅 | 滚动到指定区块 |
 |---|---|---|
-| ![initial](docs/screenshots/e2e-1-initial.png) | ![expanded](docs/screenshots/e2e-2-expanded.png) | ![saved](docs/screenshots/e2e-3-saved.png) |
+| ![figma initial](docs/screenshots/figma-1-initial.png) | ![figma cookies dismissed](docs/screenshots/figma-2-cookies-dismissed.png) | ![figma scrolled](docs/screenshots/figma-3-scrolled.png) |
+
+**这些是真实截图。** 插件的 Agent 打开了 [figma.com](https://www.figma.com)，点击 **Allow all cookies** 关掉 Cookie 横幅，然后滚动页面——每一步都通过 `computer_use` 发出（open → screenshot → get_state → click → scroll → screenshot），和真人操作的闭环完全一致。
 
 ## 它做什么
 
@@ -32,7 +34,7 @@
 - **混合感知**（视觉 + 结构）：`get_state` 返回可交互元素的辅助功能风格快照及屏幕框坐标，模型可以精确定位目标，而不是猜坐标。
 - **附件管线截图**：当调用模型路由声明 image 输入时，截图进入 DSH 持久化附件库并按路由尺寸投影（与官方 `dsh-cua` 同一流程）；文本模型自动回退为文件路径。
 - **会话隔离**：每个 Agent 一个私有 Chromium 会话，复用已安装的 Google Chrome（无需下载浏览器）。
-- **桌面扩展点**：`drivers/desktop.js` 定义了 macOS 驱动契约（Accessibility + ScreenCaptureKit），见 [Roadmap](#roadmap)。
+- **桌面扩展点**：`drivers/desktop.js` 定义了 macOS 驱动契约（Accessibility + ScreenCaptureKit），作为下一步——本地桌面应用（如 Figma 桌面版）将通过该驱动操作，而 Figma **网页版**现在就能通过浏览器驱动使用，见 [Roadmap](#roadmap)。
 
 ## 安装
 
@@ -115,8 +117,9 @@ computer-use/
 
 如实说明，2026-10-30 在 DeepSeek Harness 0.2.1-rc.3 上验证：
 
-- **独立 e2e**（`test/driver.e2e.mjs`）：open / screenshot（1280×800 PNG）/ get_state（无损 JSON）/ 点击展开 / 输入 / 点击保存 / 状态翻转 + 输入值回读 / keypress / scroll —— **全部通过**。
+- **独立 e2e**（`test/driver.e2e.mjs`）：open / screenshot（1280×800 PNG）/ get_state（无损 JSON）/ 点击展开 / 输入 / 点击保存 / 状态翻转 + 输入值回读 / keypress / scroll —— 在本地演示页（`test-page.html`）上**全部通过**。
 - **Harness 内闭环**：lead agent 实际调用 `computer_use` 全流程——打开演示页、截图、`get_state` 拿元素框坐标、点击"查看任务详情"、输入 `hello computer use`、点击"保存备注"，再用第二次 `get_state` 确认状态翻转为"任务状态：已经完成"且输入框保留文本。
+- **真实站点操作**：同一套工具驱动了 [figma.com](https://www.figma.com)——打开站点、点击 *Allow all cookies*（重截图确认横幅消失）、滚动到 *Explore Figma's agent* 区块；上方截图即来自这次操作。
 - **已知限制**：文本模型路由（如未声明 image 输入的 `deepseek-v4-flash`）下截图回退为文件路径；换成图像模型即可收到内联图像内容块。
 
 截图中的演示服务器是一次性的（`python3 -m http.server` 服务 `test-page.html`），不属于插件。

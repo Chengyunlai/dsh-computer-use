@@ -8,9 +8,11 @@
 
 A Cordis plugin that gives DeepSeek Harness agents a `computer_use` tool: take a screenshot of the current view, click at pixel coordinates, type text, press keys, scroll, and read the interactive page state. The agent drives the full **observe → reason → act → verify** loop on its own — no PyAutoGUI, no pre-scripted coordinates.
 
-| Initial page | Expanded & typed | Saved result |
+| Initial viewport | Cookie banner dismissed | Scrolled to a section |
 |---|---|---|
-| ![initial](docs/screenshots/e2e-1-initial.png) | ![expanded](docs/screenshots/e2e-2-expanded.png) | ![saved](docs/screenshots/e2e-3-saved.png) |
+| ![figma initial](docs/screenshots/figma-1-initial.png) | ![figma cookies dismissed](docs/screenshots/figma-2-cookies-dismissed.png) | ![figma scrolled](docs/screenshots/figma-3-scrolled.png) |
+
+**These are real screenshots.** The plugin's agent opened [figma.com](https://www.figma.com), dismissed the cookie banner by clicking **Allow all cookies**, then scrolled — every step issued through `computer_use` (open → screenshot → get_state → click → scroll → screenshot), exactly the loop a human would run.
 
 ## What it does
 
@@ -32,7 +34,7 @@ This maps onto the classic Computer Use architecture — and the plugin is delib
 - **Hybrid perception** (vision + structure, as the classic design suggests): `get_state` returns an accessibility-style snapshot of interactive elements with their on-screen boxes, so the model can locate targets precisely instead of guessing coordinates.
 - **Attachment-pipeline screenshots.** When the calling model route declares image input, screenshots enter DSH's durable attachment store and are projected to the route's request size (same flow as the official `dsh-cua`). Text-only models get a graceful file fallback.
 - **Isolated sessions.** One private Chromium session per agent, reusing the installed Google Chrome (no browser download).
-- **Desktop extension point.** `drivers/desktop.js` defines the macOS driver contract (Accessibility + ScreenCaptureKit) as the next step — see [Roadmap](#roadmap).
+- **Desktop extension point.** `drivers/desktop.js` defines the macOS driver contract (Accessibility + ScreenCaptureKit) as the next step — the native desktop app (e.g. the Figma desktop app) is operated through that driver, while the Figma **web** app already works today via the browser driver — see [Roadmap](#roadmap).
 
 ## Install
 
@@ -116,8 +118,9 @@ computer-use/
 
 Honest status, verified on 2026-10-30 against DeepSeek Harness 0.2.1-rc.3:
 
-- **Standalone e2e** (`test/driver.e2e.mjs`): open / screenshot (1280×800 PNG) / get_state (lossless JSON) / click-to-expand / type / click-to-save / status flip + input value readback / keypress / scroll — **all pass**.
+- **Standalone e2e** (`test/driver.e2e.mjs`): open / screenshot (1280×800 PNG) / get_state (lossless JSON) / click-to-expand / type / click-to-save / status flip + input value readback / keypress / scroll — **all pass** on the local demo page (`test-page.html`).
 - **In-harness loop**: the lead agent actually called `computer_use` end to end — opened the demo page, screenshot, `get_state` → element boxes, clicked *查看任务详情*, typed `hello computer use`, clicked *保存备注*, and verified via a second `get_state` that the status flipped to *任务状态：已经完成* and the input kept the typed text.
+- **Real-world operation**: the same tool drove [figma.com](https://www.figma.com) — opened the site, clicked *Allow all cookies* (banner gone, verified by re-screenshot), scrolled to the *Explore Figma's agent* section; the screenshots above are those captures.
 - **Known limitation**: with a text-only model route (e.g. `deepseek-v4-flash` without image input declared), screenshots fall back to file paths; switch to an image-capable model to receive inline image content blocks.
 
 The demo server in the screenshots is a throwaway (`python3 -m http.server` serving `test-page.html`) — it is not part of the plugin.
