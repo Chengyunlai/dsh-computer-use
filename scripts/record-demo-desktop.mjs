@@ -1,9 +1,9 @@
 /**
  * Desktop demo recorder — operates the real macOS Calculator and captures a
- * frame per step, for assembling a README GIF (docs/demos/desktop-calculator.gif).
+ * target-window frame per step, for a local GIF (docs/demos/desktop-calculator.gif).
  *
  * Requires the helper to have Accessibility + Screen Recording permissions.
- * The demo temporarily activates Calculator (steals focus from the frontmost app).
+ * Captures contain only the Calculator window; missing targets fail closed.
  *
  * Usage:  node scripts/record-demo-desktop.mjs
  * Frames: demos/frames/desktop/frame-%04d.png
@@ -25,6 +25,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let frame = 0
 async function snap(label) {
   const shot = await driver.screenshot()
+  if (shot.scope !== 'window') throw new Error('Recording requires a target-window capture')
   const name = `frame-${String(++frame).padStart(4, '0')}.png`
   await writeFile(join(dir, name), shot.bytes)
   console.log(`captured ${name} (${label})`)
@@ -52,11 +53,10 @@ try {
   // Keep Calculator visible for the GIF (the app stays frontmost during the
   // demo; input still goes through background AX presses that do not move
   // the real pointer).
-  await driver.activate(driver.targetPid)
-  await sleep(600)
-  console.log('Calculator frontmost (mouse untouched)')
+  console.log('Capturing Calculator window only')
 
   await snap('calculator ready')
+  state = await driver.getState()
   const click = async (el, label) => {
     const cx = Math.round(el.box.x + el.box.width / 2)
     const cy = Math.round(el.box.y + el.box.height / 2)

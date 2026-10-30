@@ -115,9 +115,8 @@ export class ComputerRouter {
   }
 
   async close() {
-    const driver = this.current()
     const surface = this.surfaceOf()
-    await driver.close()
+    await Promise.all([this.browser?.close(), this.desktop?.close()])
     this.active = null
     return { ok: true, closed: surface }
   }

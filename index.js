@@ -212,9 +212,9 @@ export function apply(ctx, config) {
 
   const computerUse = ctx.get('computerUse')
   const releaseComputerUse = computerUse ? computerUse.register('@local/dsh-computer-use') : undefined
-  ctx.on('dispose', () => {
+  ctx.on('dispose', async () => {
     if (releaseComputerUse) void releaseComputerUse()
-    for (const key of [...sessions.keys()]) void closeSession(key)
+    await Promise.all([...sessions.keys()].map((key) => closeSession(key)))
   })
 
   logger.info('computer_use plugin active (mode=%s)', config.mode)

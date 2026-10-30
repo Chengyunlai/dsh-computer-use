@@ -3,7 +3,7 @@
     - id: computer-use
       name: '@local/dsh-computer-use'
       config:
-        driver: browser
+        mode: auto
         browser:
           channel: chrome
           headless: false
@@ -11,4 +11,4 @@
             width: 1280
             height: 800
         desktop:
-          helperPath: null
+          inputMode: background

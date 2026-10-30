@@ -15,31 +15,108 @@
  * logical points. The driver converts model-side screenshot pixels to
  * logical points using the scale factor of the most recent screenshot.
  */
-import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { execFile, spawn } from 'node:child_process'
+import { readFile, unlink, rmdir } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join, dirname } from 'node:path'
 
 const DEFAULT_HELPER = join(dirname(fileURLToPath(import.meta.url)), '..', 'native', 'macos-helper')
 
-function runHelper(helperPath, command, args, timeoutMs = 20000) {
-  return new Promise((resolve, reject) => {
-    execFile(helperPath, [command, JSON.stringify(args ?? {})], { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout) => {
-      if (error) {
-        let parsed
-        try { parsed = JSON.parse(stdout) } catch { /* fall through */ }
-        const message = parsed?.error ?? String(error?.message ?? error)
-        const code = parsed?.code ?? 'HELPER_ERROR'
-        reject(Object.assign(new Error(message), { code }))
-        return
-      }
-      try {
-        resolve(JSON.parse(stdout))
-      } catch {
-        reject(Object.assign(new Error(`helper returned invalid JSON for ${command}`), { code: 'HELPER_PROTOCOL' }))
+// One resident helper daemon per driver: JSON commands on stdin, JSON results
+// on stdout (one line each, serial). A crashed daemon is respawned lazily;
+// a timed-out call rejects and resets the pipe.
+export class DaemonClient {
+  constructor(helperPath, logger) {
+    this.helperPath = helperPath
+    this.logger = logger
+    this.proc = null
+    this.buffer = ''
+    this.pending = []
+  }
+
+  ensure() {
+    if (this.proc && !this.proc.killed) return
+    const proc = spawn(this.helperPath, ['daemon'])
+    this.proc = proc
+    this.buffer = ''
+    proc.stdout.on('data', (chunk) => {
+      this.buffer += chunk.toString()
+      let idx
+      while ((idx = this.buffer.indexOf('\n')) >= 0) {
+        const line = this.buffer.slice(0, idx).trim()
+        this.buffer = this.buffer.slice(idx + 1)
+        if (line) this.#resolveOne(line)
       }
     })
-  })
+    proc.stderr.on('data', (chunk) => this.logger?.debug?.(`helper stderr: ${String(chunk).trim()}`))
+    proc.on('exit', (code) => {
+      if (this.proc !== proc) return
+      this.proc = null
+      const error = Object.assign(new Error(`helper daemon exited (${code})`), { code: 'HELPER_DAEMON_EXITED' })
+      for (const { reject, timer } of this.pending.splice(0)) {
+        clearTimeout(timer)
+        reject(error)
+      }
+    })
+    proc.on('error', (error) => {
+      if (this.proc !== proc) return
+      this.proc = null
+      for (const { reject, timer } of this.pending.splice(0)) {
+        clearTimeout(timer)
+        reject(error)
+      }
+    })
+  }
+
+  #resolveOne(line) {
+    let parsed
+    try { parsed = JSON.parse(line) } catch { parsed = null }
+    const entry = this.pending.shift()
+    if (!entry) return
+    clearTimeout(entry.timer)
+    if (parsed?.ok === false || parsed === null) {
+      entry.reject(Object.assign(new Error(parsed?.error ?? 'helper returned an invalid response'), { code: parsed?.code ?? 'HELPER_PROTOCOL' }))
+    } else {
+      entry.resolve(parsed)
+    }
+  }
+
+  call(command, args, timeoutMs = 20000) {
+    this.ensure()
+    const started = Date.now()
+    return new Promise((resolve, reject) => {
+      const finish = (fn, value) => {
+        process.stderr.write(`[daemon] ${command} ${Date.now() - started}ms\n`)
+        fn(value)
+      }
+      const timer = setTimeout(() => {
+        const error = Object.assign(new Error(`helper daemon timed out for ${command}`), { code: 'HELPER_TIMEOUT' })
+        for (const entry of this.pending.splice(0)) {
+          clearTimeout(entry.timer)
+          entry.reject(error)
+        }
+        this.close()
+      }, timeoutMs)
+      this.pending.push({ resolve: (v) => finish(resolve, v), reject: (e) => finish(reject, e), timer })
+      this.proc.stdin.write(JSON.stringify({ cmd: command, args: args ?? {} }) + '\n')
+    })
+  }
+
+  async close() {
+    const proc = this.proc
+    const exited = proc && proc.exitCode === null && proc.signalCode === null
+      ? new Promise((resolve) => proc.once('exit', resolve)) : Promise.resolve()
+    if (this.proc && !this.proc.killed) {
+      try { this.proc.stdin.end() } catch { /* already closed */ }
+      this.proc.kill()
+    }
+    this.proc = null
+    for (const { reject, timer } of this.pending.splice(0)) {
+      clearTimeout(timer)
+      reject(Object.assign(new Error('helper daemon closed'), { code: 'HELPER_CLOSED' }))
+    }
+    await exited
+  }
 }
 
 export class DesktopDriver {
@@ -47,6 +124,8 @@ export class DesktopDriver {
     this.helperPath = options.helperPath ?? DEFAULT_HELPER
     this.inputMode = options.inputMode ?? 'background'
     this.logger = options.logger
+    this.daemon = new DaemonClient(this.helperPath, options.logger)
+    this.origin = { x: 0, y: 0 }
     this.scale = 2
     this.screenW = 0
     this.screenH = 0
@@ -56,8 +135,34 @@ export class DesktopDriver {
     this.lastElements = []
   }
 
-  async #run(command, args) {
-    return runHelper(this.helperPath, command, args)
+  async #run(command, args, timeoutMs) {
+    return this.daemon.call(command, args, timeoutMs)
+  }
+
+  // Single-shot call. CGWindowListCopyWindowInfo hangs inside daemon child
+  // processes in this remote/virtual display environment, so the window list
+  // uses a direct call instead (fast and reliable).
+  #runOnce(command, args, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      execFile(this.helperPath, [command, JSON.stringify(args ?? {})], { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout) => {
+        if (error) {
+          let parsed
+          try { parsed = JSON.parse(stdout) } catch { /* fall through */ }
+          reject(Object.assign(new Error(parsed?.error ?? String(error?.message ?? error)), { code: parsed?.code ?? 'HELPER_ERROR' }))
+          return
+        }
+        try {
+          const value = JSON.parse(stdout)
+          if (value.ok !== true) {
+            reject(Object.assign(new Error(value.error ?? 'Invalid helper response'), { code: value.code ?? 'HELPER_PROTOCOL' }))
+          } else {
+            resolve(value)
+          }
+        } catch {
+          reject(Object.assign(new Error(`helper returned invalid JSON for ${command}`), { code: 'HELPER_PROTOCOL' }))
+        }
+      })
+    })
   }
 
   async ensure() {
@@ -79,8 +184,14 @@ export class DesktopDriver {
     await this.ensure()
     // Screen Recording is only required for captures; the helper reports a
     // SCREEN_RECORDING_REQUIRED error here when it is missing.
-    const shot = await this.#run('screenshot')
-    const bytes = await readFile(shot.path)
+    if (!this.targetPid) throw Object.assign(new Error('先打开目标应用再截图'), { code: 'TARGET_REQUIRED' })
+    const shot = await this.#runOnce('screenshot', { pid: this.targetPid })
+    let bytes
+    try { bytes = await readFile(shot.path) } finally {
+      await unlink(shot.path)
+      await rmdir(dirname(shot.path))
+    }
+    this.origin = shot.origin
     this.scale = shot.scaleFactor ?? this.scale
     this.screenW = shot.screenBounds?.width ?? 0
     this.screenH = shot.screenBounds?.height ?? 0
@@ -91,13 +202,14 @@ export class DesktopDriver {
       pixelHeight: shot.height,
       scaleFactor: this.scale,
       url: null,
-      title: null,
+      title: this.targetName,
+      scope: 'window',
     }
   }
 
   async getState() {
     await this.ensure()
-    const windows = await this.#run('listWindows')
+    const windows = await this.#runOnce('listWindows')
     const pid = this.targetPid ?? (await this.#run('axstate')).app?.pid
     let ax = { app: null, window: null, elements: [] }
     if (pid) {
@@ -115,56 +227,20 @@ export class DesktopDriver {
         text: el.label ?? '',
         index: el.index,
         box: {
-          x: Math.round((b.x ?? 0) * scale),
-          y: Math.round((b.y ?? 0) * scale),
+          x: Math.round(((b.x ?? 0) - this.origin.x) * scale),
+          y: Math.round(((b.y ?? 0) - this.origin.y) * scale),
           width: Math.round((b.width ?? 0) * scale),
           height: Math.round((b.height ?? 0) * scale),
         },
       }
     }).filter((el) => el.box.width > 0 && el.box.height > 0)
 
-    // OCR fallback: apps that expose no Accessibility tree (e.g. Electron)
-    // are read visually — recognized text with pixel boxes, filtered to the
-    // target window's region. Clicking these elements falls back to
-    // coordinate input (they have no AX press target).
-    if (elements.length === 0 && pid) {
-      try {
-        const ocr = await this.#run('ocr')
-        const win = (windows.windows ?? []).find((w) => w.pid === pid)
-        const wb = win?.bounds
-        const ox = wb ? wb.x * scale : -1e9
-        const oy = wb ? wb.y * scale : -1e9
-        const ow = wb ? wb.width * scale : 1e9
-        const oh = wb ? wb.height * scale : 1e9
-        elements = (ocr.items ?? []).map((item) => {
-          const b = item.box ?? {}
-          return {
-            role: 'text',
-            text: item.text ?? '',
-            source: 'ocr',
-            box: {
-              x: Math.round(b.x ?? 0),
-              y: Math.round(b.y ?? 0),
-              width: Math.round(b.width ?? 0),
-              height: Math.round(b.height ?? 0),
-            },
-          }
-        }).filter((el) => {
-          if (el.box.width <= 0 || el.box.height <= 0) return false
-          const cx = el.box.x + el.box.width / 2
-          const cy = el.box.y + el.box.height / 2
-          return cx >= ox - 40 && cx <= ox + ow + 40 && cy >= oy - 40 && cy <= oy + oh + 40
-        })
-      } catch {
-        // OCR is best-effort; keep an empty element list when it fails
-      }
-    }
     this.lastElements = elements
     const window = ax.window ? {
       title: ax.window.title ?? '',
       box: {
-        x: Math.round((ax.window.box?.x ?? 0) * scale),
-        y: Math.round((ax.window.box?.y ?? 0) * scale),
+        x: Math.round(((ax.window.box?.x ?? 0) - this.origin.x) * scale),
+        y: Math.round(((ax.window.box?.y ?? 0) - this.origin.y) * scale),
         width: Math.round((ax.window.box?.width ?? 0) * scale),
         height: Math.round((ax.window.box?.height ?? 0) * scale),
       },
@@ -226,8 +302,8 @@ export class DesktopDriver {
           // OCR-recognized text has no AX press target; click by coordinates
           // via postToPid (virtual, does not move the real pointer). Targeted
           // events reach Electron apps only while they are frontmost.
-          const sx = Math.round(x / this.scale)
-          const sy = Math.round(y / this.scale)
+          const sx = Math.round(x / this.scale + this.origin.x)
+          const sy = Math.round(y / this.scale + this.origin.y)
           await this.#run('click', { x: sx, y: sy, pid: this.targetPid })
           return { ok: true, x, y, via: 'postToPid', element: target.text, button, clickCount }
         }
@@ -242,8 +318,8 @@ export class DesktopDriver {
         { code: 'AX_TARGET_REQUIRED' },
       )
     }
-    const sx = Math.round(x / this.scale)
-    const sy = Math.round(y / this.scale)
+    const sx = Math.round(x / this.scale + this.origin.x)
+    const sy = Math.round(y / this.scale + this.origin.y)
     for (let i = 0; i < clickCount; i++) {
       await this.#run('click', { x: sx, y: sy, button })
       if (i < clickCount - 1) await new Promise((r) => setTimeout(r, 120))
@@ -305,7 +381,7 @@ export class DesktopDriver {
         { code: 'AX_SCROLL_UNSUPPORTED' },
       )
     }
-    await this.#run('scroll', { x: Math.round(x / this.scale), y: Math.round(y / this.scale), deltaX, deltaY })
+    await this.#run('scroll', { x: Math.round(x / this.scale + this.origin.x), y: Math.round(y / this.scale + this.origin.y), deltaX, deltaY })
     return { ok: true, x, y, deltaX, deltaY }
   }
 
@@ -328,7 +404,7 @@ export class DesktopDriver {
   }
 
   async close() {
-    // The helper is stateless; nothing to release.
+    await this.daemon.close()
     return { ok: true }
   }
 }

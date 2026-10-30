@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 /screenshots/
 native/macos-helper
+demos/frames/
+docs/demos/desktop*.gif
+demos/desktop*.gif

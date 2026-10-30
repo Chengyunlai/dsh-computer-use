@@ -20,17 +20,14 @@ import Vision
 
 // MARK: - JSON plumbing
 
-func fail(_ message: String, code: String = "HELPER_ERROR") -> Never {
-    let out: [String: Any] = ["ok": false, "error": message, "code": code]
-    print(toJson(out))
-    exit(1)
+func fail(_ message: String, code: String = "HELPER_ERROR") -> [String: Any] {
+    ["ok": false, "error": message, "code": code]
 }
 
-func ok(_ extra: [String: Any] = [:]) -> Never {
+func ok(_ extra: [String: Any] = [:]) -> [String: Any] {
     var out: [String: Any] = ["ok": true]
     for (k, v) in extra { out[k] = v }
-    print(toJson(out))
-    exit(0)
+    return out
 }
 
 func toJson(_ value: Any) -> String {
@@ -42,7 +39,7 @@ func toJson(_ value: Any) -> String {
 func parseArgs(_ json: String) -> [String: Any] {
     guard let data = json.data(using: .utf8),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        fail("invalid arguments JSON")
+        return fail("invalid arguments JSON")
     }
     return obj
 }
@@ -59,14 +56,14 @@ func checkPermissions() -> [String: Bool] {
     return ["accessibility": ax, "screenRecording": sr]
 }
 
-func requestPermissions() -> Never {
+func requestPermissions() -> [String: Any] {
     // Triggers the system prompts: Accessibility (AX API) and Screen Recording.
     // Each prompt offers "Open System Settings", which lands on the matching pane.
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     _ = AXIsProcessTrustedWithOptions(options)
     _ = CGRequestScreenCaptureAccess()
     usleep(300_000)
-    ok(checkPermissions())
+    return ok(checkPermissions())
 }
 
 // MARK: - Screenshot (ScreenCaptureKit)
@@ -78,22 +75,19 @@ final class ScreenCapturer: NSObject, SCStreamOutput {
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, errorMessage == nil else { return }
-        guard let frame = sampleBuffer.imageBuffer else {
-            errorMessage = "无帧数据"
-            sem.signal()
-            return
-        }
+        guard let frame = sampleBuffer.imageBuffer else { return }
         let ci = CIImage(cvImageBuffer: frame)
         image = CIContext().createCGImage(ci, from: ci.extent)
         sem.signal()
     }
 }
 
-func captureContent(windowId: CGWindowID? = nil) -> (CGImage, Double) {
+func captureContent(windowId: CGWindowID? = nil) -> (CGImage?, Double, [String: Any]?) {
+    guard windowId != nil else { return (nil, 0, fail("需要目标窗口", code: "TARGET_REQUIRED")) }
     let perms = checkPermissions()
     guard perms["screenRecording"] == true else {
-        fail("屏幕录制权限未授予：请在 系统设置 → 隐私与安全性 → 屏幕录制 中添加本 helper",
-             code: "SCREEN_RECORDING_REQUIRED")
+        return (nil, 0, fail("屏幕录制权限未授予：请在 系统设置 → 隐私与安全性 → 屏幕录制 中添加本 helper",
+             code: "SCREEN_RECORDING_REQUIRED"))
     }
     var content: SCShareableContent?
     var contentError: Error?
@@ -105,18 +99,21 @@ func captureContent(windowId: CGWindowID? = nil) -> (CGImage, Double) {
     }
     ready.wait()
     guard let content = content, let display = content.displays.first else {
-        fail("无法获取屏幕内容: \(String(describing: contentError))", code: "CAPTURE_FAILED")
+        return (nil, 0, fail("无法获取屏幕内容: \(String(describing: contentError))", code: "CAPTURE_FAILED"))
     }
     // Window-scoped capture: ScreenCaptureKit reads the window's own content
     // even when it is occluded by other windows (the Codex-style background
-    // observation). Fall back to the whole display.
+    // observation). A missing window is an error.
     let filter: SCContentFilter
     var capWidth = display.width
     var capHeight = display.height
-    if let windowId = windowId, let window = content.windows.first(where: { $0.windowID == windowId }) {
+    if let windowId = windowId {
+        guard let window = content.windows.first(where: { $0.windowID == windowId }) else {
+            return (nil, 0, fail("目标窗口不存在", code: "WINDOW_NOT_FOUND"))
+        }
         filter = SCContentFilter(desktopIndependentWindow: window)
-        capWidth = Int(window.frame.width)
-        capHeight = Int(window.frame.height)
+        capWidth = Int(window.frame.width * (NSScreen.main?.backingScaleFactor ?? 2))
+        capHeight = Int(window.frame.height * (NSScreen.main?.backingScaleFactor ?? 2))
     } else {
         filter = SCContentFilter(display: display, excludingWindows: [])
     }
@@ -124,54 +121,79 @@ func captureContent(windowId: CGWindowID? = nil) -> (CGImage, Double) {
     config.width = capWidth
     config.height = capHeight
     config.showsCursor = false
-    let capturer = ScreenCapturer()
-    let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-    do {
-        // NOT .main: the CLI main thread blocks on the semaphore below, so a
-        // main-queue handler would never run. Use a dedicated queue.
-        try stream.addStreamOutput(capturer, type: .screen, sampleHandlerQueue: DispatchQueue(label: "dsh-capture"))
-        try stream.startCapture()
-    } catch {
-        fail("开始截屏失败: \(error)", code: "CAPTURE_FAILED")
+    var capturedImage: CGImage?
+    var failure: Error?
+    let captured = DispatchSemaphore(value: 0)
+    if #available(macOS 14.0, *) {
+        SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, error in
+            capturedImage = image
+            failure = error
+            captured.signal()
+        }
+    } else {
+        return (nil, 0, fail("窗口截图需要 macOS 14 或更新版本", code: "OS_UNSUPPORTED"))
     }
-    _ = capturer.sem.wait(timeout: .now() + .seconds(5))
-    stream.stopCapture()
-    guard let image = capturer.image else {
-        fail(capturer.errorMessage ?? "截图失败", code: "CAPTURE_FAILED")
+    guard captured.wait(timeout: .now() + .seconds(10)) == .success,
+          let image = capturedImage else {
+        return (nil, 0, fail("窗口截图失败: \(String(describing: failure))", code: "CAPTURE_FAILED"))
     }
     let scale = NSScreen.main?.backingScaleFactor ?? 2.0
-    return (image, scale)
+    return (image, scale, nil)
 }
 
-func screenshot() -> Never {
-    let (image, scale) = captureContent()
+func screenshot(_ args: [String: Any]) -> [String: Any] {
+    guard let pid = (args["pid"] as? NSNumber)?.int32Value else {
+        return fail("截图需要目标应用 pid", code: "TARGET_REQUIRED")
+    }
+    let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+    let rows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+    let candidates = rows.filter {
+        guard let frame = $0[kCGWindowBounds as String] as? [String: Any] else { return false }
+        return ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid &&
+            ($0[kCGWindowLayer as String] as? Int) == 0 &&
+            (frame["Width"] as? Double ?? 0) > 100 && (frame["Height"] as? Double ?? 0) > 100
+    }.sorted {
+        let a = $0[kCGWindowBounds as String] as? [String: Double] ?? [:]
+        let b = $1[kCGWindowBounds as String] as? [String: Double] ?? [:]
+        return (a["Width"] ?? 0) * (a["Height"] ?? 0) > (b["Width"] ?? 0) * (b["Height"] ?? 0)
+    }
+    guard let row = candidates.first, let number = row[kCGWindowNumber as String] as? NSNumber,
+    let bounds = row[kCGWindowBounds as String] as? [String: Any] else {
+        return fail("目标应用没有可截图窗口", code: "WINDOW_NOT_FOUND")
+    }
+    let (image, scale, captureError) = captureContent(windowId: number.uint32Value)
+    guard let image = image else { return captureError! }
     let dir = NSTemporaryDirectory()
-    let path = dir + "dsh-computer-use-\(Int(Date().timeIntervalSince1970 * 1000)).png"
+    let privateDir = dir + "dsh-computer-use-\(UUID().uuidString)/"
+    do { try FileManager.default.createDirectory(atPath: privateDir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
+    catch { return fail("无法创建截图目录", code: "CAPTURE_FAILED") }
+    let path = privateDir + "capture.png"
     guard let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL,
                                                      UTType.png.identifier as CFString, 1, nil) else {
-        fail("无法创建 PNG 目标", code: "CAPTURE_FAILED")
+        return fail("无法创建 PNG 目标", code: "CAPTURE_FAILED")
     }
     CGImageDestinationAddImage(dest, image, nil)
     guard CGImageDestinationFinalize(dest) else {
-        fail("PNG 写入失败", code: "CAPTURE_FAILED")
+        return fail("PNG 写入失败", code: "CAPTURE_FAILED")
     }
-    ok(["path": path,
+    return ok(["path": path,
         "width": image.width,
         "height": image.height,
         "scaleFactor": scale,
         "mimeType": "image/png",
-        "screenBounds": ["x": 0, "y": 0,
-                         "width": Double(NSScreen.main?.frame.width ?? 0),
-                         "height": Double(NSScreen.main?.frame.height ?? 0)]])
+        "scope": "window",
+        "origin": ["x": bounds["X"] ?? 0, "y": bounds["Y"] ?? 0],
+        "screenBounds": bounds])
 }
 
-func ocr(_ args: [String: Any]) -> Never {
+func ocr(_ args: [String: Any]) -> [String: Any] {
     // Vision OCR over the screen (or one window when `windowId` is given):
     // returns recognized text with pixel boxes (top-left origin, physical
     // pixels) — a visual fallback for apps that expose no Accessibility
     // tree (e.g. Electron), including occluded windows.
     let windowId = (args["windowId"] as? NSNumber)?.uint32Value
-    let (image, scale) = captureContent(windowId: windowId)
+    let (image, scale, captureError) = captureContent(windowId: windowId)
+    guard let image = image else { return captureError! }
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = false
@@ -180,7 +202,7 @@ func ocr(_ args: [String: Any]) -> Never {
     do {
         try handler.perform([request])
     } catch {
-        fail("OCR 失败: \(error)", code: "OCR_FAILED")
+        return fail("OCR 失败: \(error)", code: "OCR_FAILED")
     }
     let w = CGFloat(image.width)
     let h = CGFloat(image.height)
@@ -195,7 +217,7 @@ func ocr(_ args: [String: Any]) -> Never {
         ]
         return ["text": top.string, "box": box]
     }
-    ok(["items": items, "scaleFactor": scale, "width": image.width, "height": image.height])
+    return ok(["items": items, "scaleFactor": scale, "width": image.width, "height": image.height])
 }
 
 // MARK: - Window list
@@ -208,9 +230,9 @@ func windowBounds(_ dict: [String: Any]) -> [String: Any] {
     return ["x": 0, "y": 0, "width": 0, "height": 0]
 }
 
-func listWindows() -> Never {
+func listWindows() -> [String: Any] {
     guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-        fail("无法枚举窗口", code: "WINDOW_LIST_FAILED")
+        return fail("无法枚举窗口", code: "WINDOW_LIST_FAILED")
     }
     let windows = list.map { w -> [String: Any] in
         ["pid": w[kCGWindowOwnerPID as String] ?? 0,
@@ -220,16 +242,17 @@ func listWindows() -> Never {
          "bounds": windowBounds(w),
          "isOnScreen": w[kCGWindowIsOnscreen as String] ?? false]
     }
-    ok(["windows": windows])
+    return ok(["windows": windows])
 }
 
 // MARK: - Events (require Accessibility permission)
 
-func requireAX() {
+func requireAX() -> [String: Any]? {
     guard AXIsProcessTrusted() else {
-        fail("辅助功能权限未授予：请在 系统设置 → 隐私与安全性 → 辅助功能 中添加本 helper",
+        return fail("辅助功能权限未授予：请在 系统设置 → 隐私与安全性 → 辅助功能 中添加本 helper",
              code: "ACCESSIBILITY_REQUIRED")
     }
+    return nil
 }
 
 func post(_ event: CGEvent, to pid: pid_t? = nil) {
@@ -256,12 +279,12 @@ func targetPid(_ args: [String: Any]) -> pid_t? {
     (args["pid"] as? NSNumber)?.int32Value
 }
 
-func click(_ args: [String: Any]) -> Never {
-    requireAX()
+func click(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
     let x: Double
-    if let v = double(args, "x") { x = v } else { fail("click 需要 x") }
+    if let v = double(args, "x") { x = v } else { return fail("click 需要 x") }
     let y: Double
-    if let v = double(args, "y") { y = v } else { fail("click 需要 y") }
+    if let v = double(args, "y") { y = v } else { return fail("click 需要 y") }
     let buttonName = (args["button"] as? String) ?? "left"
     let button: CGMouseButton = buttonName == "right" ? .right : (buttonName == "middle" ? .center : .left)
     let pid = targetPid(args)
@@ -276,12 +299,12 @@ func click(_ args: [String: Any]) -> Never {
     if let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: button) {
         post(up, to: pid)
     }
-    ok()
+    return ok()
 }
 
-func typeText(_ args: [String: Any]) -> Never {
-    requireAX()
-    guard let text = args["text"] as? String else { fail("type 需要 text") }
+func typeText(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
+    guard let text = args["text"] as? String else { return fail("type 需要 text") }
     let pid = targetPid(args)
     for scalar in text.unicodeScalars {
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true) else { continue }
@@ -293,7 +316,7 @@ func typeText(_ args: [String: Any]) -> Never {
         post(up, to: pid)
         usleep(20_000)
     }
-    ok()
+    return ok()
 }
 
 // MARK: - Keycodes
@@ -325,9 +348,9 @@ func keyFlags(_ modifier: String) -> CGEventFlags {
     }
 }
 
-func pressKey(_ args: [String: Any]) -> Never {
-    requireAX()
-    guard let chord = args["key"] as? String, !chord.isEmpty else { fail("keypress 需要 key") }
+func pressKey(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
+    guard let chord = args["key"] as? String, !chord.isEmpty else { return fail("keypress 需要 key") }
     let parts = chord.split(separator: "+").map(String.init)
     var flags: CGEventFlags = []
     var keyName = ""
@@ -340,7 +363,7 @@ func pressKey(_ args: [String: Any]) -> Never {
         }
     }
     let code: CGKeyCode
-    if let v = KEYCODES[keyName] { code = v } else { fail("不支持的按键: \(chord)") }
+    if let v = KEYCODES[keyName] { code = v } else { return fail("不支持的按键: \(chord)") }
     let pid = targetPid(args)
     if let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true) {
         down.flags = flags
@@ -351,11 +374,11 @@ func pressKey(_ args: [String: Any]) -> Never {
         up.flags = flags
         post(up, to: pid)
     }
-    ok()
+    return ok()
 }
 
-func scroll(_ args: [String: Any]) -> Never {
-    requireAX()
+func scroll(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
     let x = double(args, "x") ?? 0
     let y = double(args, "y") ?? 0
     let dx = double(args, "deltaX") ?? 0
@@ -366,17 +389,17 @@ func scroll(_ args: [String: Any]) -> Never {
                            wheel1: Int32(-dy), wheel2: Int32(-dx), wheel3: 0) {
         post(event, to: pid)
     }
-    ok()
+    return ok()
 }
 
-func mousePosition() -> Never {
+func mousePosition() -> [String: Any] {
     // Current real pointer location, for verifying background input never
     // moves the user's mouse.
     if let event = CGEvent(source: nil) {
         let p = event.location
-        ok(["x": p.x, "y": p.y])
+        return ok(["x": p.x, "y": p.y])
     }
-    fail("无法读取鼠标位置", code: "MOUSE_POSITION_FAILED")
+    return fail("无法读取鼠标位置", code: "MOUSE_POSITION_FAILED")
 }
 
 // MARK: - AX state
@@ -476,18 +499,18 @@ func axTree(pid: pid_t) -> (app: [String: Any], window: [String: Any]?, elements
     return (["name": app?.localizedName ?? "", "pid": pid], window, walker.collected, walker.refs)
 }
 
-func axState(_ args: [String: Any]) -> Never {
-    requireAX()
+func axState(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
     let pid = targetPid(args) ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
-    guard let pid = pid else { fail("无法解析目标应用", code: "AX_FAILED") }
+    guard let pid = pid else { return fail("无法解析目标应用", code: "AX_FAILED") }
     let (app, window, elements, _) = axTree(pid: pid)
-    ok(["app": app, "window": window, "elements": elements])
+    return ok(["app": app, "window": window, "elements": elements])
 }
 
-func axPress(_ args: [String: Any]) -> Never {
-    requireAX()
+func axPress(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
     let pid = targetPid(args)
-    guard let pid = pid else { fail("axpress 需要 pid") }
+    guard let pid = pid else { return fail("axpress 需要 pid") }
     let (_, _, _, refs) = axTree(pid: pid)
 
     func strip(_ s: String) -> String {
@@ -506,30 +529,30 @@ func axPress(_ args: [String: Any]) -> Never {
                 + (axString(ref, kAXDescriptionAttribute as CFString) ?? ""))
             if l == want {
                 let error = AXUIElementPerformAction(ref, kAXPressAction as CFString)
-                if error != .success { fail("AX press 失败: \(error.rawValue)", code: "AX_PRESS_FAILED") }
-                ok(["index": i, "label": label])
+                if error != .success { return fail("AX press 失败: \(error.rawValue)", code: "AX_PRESS_FAILED") }
+                return ok(["index": i, "label": label])
             }
         }
-        fail("未找到元素: \(label)", code: "AX_LABEL_NOT_FOUND")
+        return fail("未找到元素: \(label)", code: "AX_LABEL_NOT_FOUND")
     }
 
     let index = (args["index"] as? NSNumber)?.intValue
-    guard let index = index else { fail("axpress 需要 index 或 label") }
-    guard index >= 0, index < refs.count else { fail("元素索引越界: \(index)", code: "AX_INDEX_OUT_OF_RANGE") }
+    guard let index = index else { return fail("axpress 需要 index 或 label") }
+    guard index >= 0, index < refs.count else { return fail("元素索引越界: \(index)", code: "AX_INDEX_OUT_OF_RANGE") }
     let element = refs[index]
     let error = AXUIElementPerformAction(element, kAXPressAction as CFString)
     if error != .success {
-        fail("AX press 失败: \(error.rawValue)", code: "AX_PRESS_FAILED")
+        return fail("AX press 失败: \(error.rawValue)", code: "AX_PRESS_FAILED")
     }
-    ok(["index": index])
+    return ok(["index": index])
 }
 
-func axSetValue(_ args: [String: Any]) -> Never {
-    requireAX()
+func axSetValue(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
     let pid = targetPid(args)
     let label = args["label"] as? String
     let value = args["value"] as? String
-    guard let pid = pid, let label = label, let value = value else { fail("axsetvalue 需要 pid/label/value") }
+    guard let pid = pid, let label = label, let value = value else { return fail("axsetvalue 需要 pid/label/value") }
     let (_, _, _, refs) = axTree(pid: pid)
     for ref in refs {
         let l = (axString(ref, kAXTitleAttribute as CFString) ?? "")
@@ -537,22 +560,22 @@ func axSetValue(_ args: [String: Any]) -> Never {
             + (axString(ref, kAXDescriptionAttribute as CFString) ?? "")
         if l == label {
             let error = AXUIElementSetAttributeValue(ref, kAXValueAttribute as CFString, value as CFTypeRef)
-            if error != .success { fail("AX setValue 失败: \(error.rawValue)", code: "AX_SETVALUE_FAILED") }
-            ok(["label": label])
+            if error != .success { return fail("AX setValue 失败: \(error.rawValue)", code: "AX_SETVALUE_FAILED") }
+            return ok(["label": label])
         }
     }
-    fail("未找到文本框: \(label)", code: "AX_LABEL_NOT_FOUND")
+    return fail("未找到文本框: \(label)", code: "AX_LABEL_NOT_FOUND")
 }
 
-func axRaise(_ args: [String: Any]) -> Never {
-    requireAX()
+func axRaise(_ args: [String: Any]) -> [String: Any] {
+    if let axErr = requireAX() { return axErr }
     let pid = targetPid(args)
-    guard let pid = pid else { fail("axraise 需要 pid") }
+    guard let pid = pid else { return fail("axraise 需要 pid") }
     let appElement = AXUIElementCreateApplication(pid)
     var windowRef: CFTypeRef?
     let err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowRef)
     guard err == .success, let windowList = windowRef as? [AXUIElement], !windowList.isEmpty else {
-        fail("目标应用没有窗口", code: "AX_NO_WINDOW")
+        return fail("目标应用没有窗口", code: "AX_NO_WINDOW")
     }
     // Raise the first window to the front WITHOUT activating the app:
     // the window becomes visible for screenshots/GIFs while focus stays with
@@ -560,9 +583,9 @@ func axRaise(_ args: [String: Any]) -> Never {
     let window = windowList[0]
     let actionError = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     if actionError != .success {
-        fail("AX raise 失败: \(actionError.rawValue)", code: "AX_RAISE_FAILED")
+        return fail("AX raise 失败: \(actionError.rawValue)", code: "AX_RAISE_FAILED")
     }
-    ok()
+    return ok()
 }
 
 // MARK: - App launch
@@ -575,27 +598,27 @@ func appMatches(_ app: NSRunningApplication, _ query: String) -> Bool {
     return name.contains(q) || file.hasPrefix(q) || file == q + ".app" || bid == q
 }
 
-func openApp(_ args: [String: Any]) -> Never {
-    guard let query = args["query"] as? String, !query.isEmpty else { fail("openapp 需要 query") }
+func openApp(_ args: [String: Any]) -> [String: Any] {
+    guard let query = args["query"] as? String, !query.isEmpty else { return fail("openapp 需要 query") }
     let ws = NSWorkspace.shared
 
     if query.contains(".") {
         if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
             app.activate(options: [.activateAllWindows])
-            ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
+            return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
         }
         if let url = ws.urlForApplication(withBundleIdentifier: query),
            ws.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) != nil {
             usleep(900_000)
             let app = ws.runningApplications.first(where: { appMatches($0, query) })
-            ok(["pid": app?.processIdentifier ?? 0, "name": app?.localizedName ?? query, "activated": false])
+            return ok(["pid": app?.processIdentifier ?? 0, "name": app?.localizedName ?? query, "activated": false])
         }
-        fail("无法启动应用 bundleId: \(query)", code: "APP_LAUNCH_FAILED")
+        return fail("无法启动应用 bundleId: \(query)", code: "APP_LAUNCH_FAILED")
     }
 
     if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
         app.activate(options: [.activateAllWindows])
-        ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
+        return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
     }
 
     // Launch by name via LaunchServices (`open -a`), which activates the app.
@@ -607,7 +630,7 @@ func openApp(_ args: [String: Any]) -> Never {
     usleep(900_000)
     if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
         app.activate(options: [.activateAllWindows])
-        ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
+        return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
     }
 
     let dirs = ["/Applications", NSString("~/Applications").expandingTildeInPath, "/System/Applications"]
@@ -618,64 +641,98 @@ func openApp(_ args: [String: Any]) -> Never {
                 if ws.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) != nil {
                     usleep(900_000)
                     let app = ws.runningApplications.first(where: { ($0.localizedName ?? "").lowercased() == query.lowercased() })
-                    ok(["pid": app?.processIdentifier ?? 0, "name": String(hit.dropLast(4)), "activated": false])
+                    return ok(["pid": app?.processIdentifier ?? 0, "name": String(hit.dropLast(4)), "activated": false])
                 }
             }
         }
     }
-    fail("未找到应用: \(query)", code: "APP_NOT_FOUND")
+    return fail("未找到应用: \(query)", code: "APP_NOT_FOUND")
 }
 
-func activateApp(_ args: [String: Any]) -> Never {
-    guard let pid = (args["pid"] as? NSNumber)?.int32Value else { fail("activate 需要 pid") }
+func activateApp(_ args: [String: Any]) -> [String: Any] {
+    guard let pid = (args["pid"] as? NSNumber)?.int32Value else { return fail("activate 需要 pid") }
     if let app = NSRunningApplication(processIdentifier: pid) {
         app.activate(options: [.activateAllWindows])
-        ok()
+        return ok()
     }
-    fail("无效 pid: \(pid)", code: "APP_NOT_FOUND")
+    return fail("无效 pid: \(pid)", code: "APP_NOT_FOUND")
 }
 
 // MARK: - Main
 
+// MARK: - Main
+
+func runMain(_ command: String, _ parsed: [String: Any]) -> [String: Any] {
+    switch command {
+    case "permissions":
+        return ok(checkPermissions())
+    case "requestpermissions":
+        return requestPermissions()
+    case "screenshot":
+        return screenshot(parsed)
+    case "ocr":
+        return ocr(parsed)
+    case "listWindows":
+        return listWindows()
+    case "axstate":
+        return axState(parsed)
+    case "axpress":
+        return axPress(parsed)
+    case "axraise":
+        return axRaise(parsed)
+    case "axsetvalue":
+        return axSetValue(parsed)
+    case "click":
+        return click(parsed)
+    case "type":
+        return typeText(parsed)
+    case "keypress":
+        return pressKey(parsed)
+    case "scroll":
+        return scroll(parsed)
+    case "mousepos":
+        return mousePosition()
+    case "openapp":
+        return openApp(parsed)
+    case "activate":
+        return activateApp(parsed)
+    default:
+        return fail("未知命令: \(command)")
+    }
+}
+
+func daemonMain() {
+    // Resident helper: one JSON command per stdin line, executed IN THIS
+    // PROCESS on a serial queue (no child processes — WindowServer calls are
+    // unreliable from daemon-spawned children in some display environments).
+    // Results print on stdout; a thrown/crashed command only kills one call
+    // thanks to the serial executor, and the daemon keeps reading.
+    let queue = DispatchQueue(label: "dsh-helper")
+    while let line = readLine() {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { continue }
+        guard let data = trimmed.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cmd = obj["cmd"] as? String else { continue }
+        let cmdArgs = (obj["args"] as? [String: Any]) ?? [:]
+        queue.sync {
+            let result = runMain(cmd, cmdArgs)
+            print(toJson(result))
+            fflush(stdout)
+        }
+    }
+    exit(0)
+}
+
 let args = CommandLine.arguments
-guard args.count >= 2 else { fail("用法: macos-helper <command> [jsonArgs]") }
+guard args.count >= 2 else { print(toJson(fail("用法: macos-helper <command> [jsonArgs]"))); exit(1) }
 let command = args[1]
 let jsonArgs = args.count >= 3 ? args[2] : "{}"
 let parsed = parseArgs(jsonArgs)
 
-switch command {
-case "permissions":
-    ok(checkPermissions())
-case "requestpermissions":
-    requestPermissions()
-case "screenshot":
-    screenshot()
-case "ocr":
-    ocr(parsed)
-case "listWindows":
-    listWindows()
-case "axstate":
-    axState(parsed)
-case "axpress":
-    axPress(parsed)
-case "axraise":
-    axRaise(parsed)
-case "axsetvalue":
-    axSetValue(parsed)
-case "click":
-    click(parsed)
-case "type":
-    typeText(parsed)
-case "keypress":
-    pressKey(parsed)
-case "scroll":
-    scroll(parsed)
-case "mousepos":
-    mousePosition()
-case "openapp":
-    openApp(parsed)
-case "activate":
-    activateApp(parsed)
-default:
-    fail("未知命令: \(command)")
+if command == "daemon" {
+    daemonMain()
+} else {
+    print(toJson(runMain(command, parsed)))
+    exit(0)
 }

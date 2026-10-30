@@ -72,7 +72,8 @@ try {
     await sleep(260)
   }
 
-  const clear = btn('全部清除') ?? btn('清除')
+  const clear = locate('全部清除') ?? locate('清除')
+  check('locates clear', Boolean(clear))
   if (clear) await clickEl(clear)
   for (const want of ['7', '加', '3', '等于']) {
     const el = btn(want)
@@ -90,17 +91,15 @@ try {
   // Screenshot (requires Screen Recording) — briefly activate Calculator so
   // its window is visible, capture, then hand focus back to the user's app.
   try {
-    await driver.activate(driver.targetPid)
-    await sleep(600)
     const shot = await driver.screenshot()
-    check('screenshot captured', shot.bytes.length > 0, `${shot.pixelWidth}x${shot.pixelHeight} @${shot.scaleFactor}x`)
+    check('window screenshot captured', shot.bytes.length > 0 && shot.scope === 'window' && shot.pixelHeight > 100, `${shot.pixelWidth}x${shot.pixelHeight} @${shot.scaleFactor}x`)
     await writeFile(join(shots, 'desktop-3-background-calculated.png'), shot.bytes)
     if (frontName) await driver.activate(front0.app.pid)
   } catch (error) {
-    console.log('SKIP screenshot:', error.code ?? String(error.message))
+    check('window screenshot captured', false, error.code ?? String(error.message))
   }
 } catch (error) {
-  console.error('ERROR:', error.code ?? '?', String(error.message))
+  check('desktop execution', false, error.code ?? String(error.message))
 } finally {
   await driver.close()
 }
