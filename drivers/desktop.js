@@ -54,13 +54,10 @@ export class DesktopDriver {
   async ensure() {
     if (this.permissionsChecked) return
     const perms = await this.#run('permissions')
-    const missing = []
-    if (perms.accessibility !== true) missing.push('辅助功能 (Accessibility)')
-    if (perms.screenRecording !== true) missing.push('屏幕录制 (Screen Recording)')
-    if (missing.length > 0) {
+    if (perms.accessibility !== true) {
       throw Object.assign(
         new Error(
-          `macOS 桌面驱动需要系统权限：请在 系统设置 → 隐私与安全性 → ${missing.join(' 和 ')} 中添加：\n${this.helperPath}\n\n` +
+          `macOS 桌面驱动需要辅助功能权限：请在 系统设置 → 隐私与安全性 → 辅助功能 中添加：\n${this.helperPath}\n\n` +
           '添加后重新打开 DeepSeek Harness（部分权限需要应用重启才生效）。',
         ),
         { code: 'DESKTOP_PERMISSION_REQUIRED' },
@@ -71,6 +68,8 @@ export class DesktopDriver {
 
   async screenshot() {
     await this.ensure()
+    // Screen Recording is only required for captures; the helper reports a
+    // SCREEN_RECORDING_REQUIRED error here when it is missing.
     const shot = await this.#run('screenshot')
     const bytes = await readFile(shot.path)
     this.scale = shot.scaleFactor ?? this.scale
@@ -163,6 +162,12 @@ export class DesktopDriver {
       if (i < clickCount - 1) await new Promise((r) => setTimeout(r, 120))
     }
     return { ok: true, x, y, button, clickCount }
+  }
+
+  async activate(pid) {
+    await this.ensure()
+    await this.#run('activate', { pid })
+    return { ok: true }
   }
 
   async type(text) {

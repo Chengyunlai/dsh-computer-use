@@ -58,6 +58,16 @@ func checkPermissions() -> [String: Bool] {
     return ["accessibility": ax, "screenRecording": sr]
 }
 
+func requestPermissions() -> Never {
+    // Triggers the system prompts: Accessibility (AX API) and Screen Recording.
+    // Each prompt offers "Open System Settings", which lands on the matching pane.
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    _ = AXIsProcessTrustedWithOptions(options)
+    _ = CGRequestScreenCaptureAccess()
+    usleep(300_000)
+    ok(checkPermissions())
+}
+
 // MARK: - Screenshot (ScreenCaptureKit)
 
 final class ScreenCapturer: NSObject, SCStreamOutput {
@@ -388,25 +398,45 @@ func axState() -> Never {
 
 // MARK: - App launch
 
+func appMatches(_ app: NSRunningApplication, _ query: String) -> Bool {
+    let q = query.lowercased()
+    let name = (app.localizedName ?? "").lowercased()
+    let file = (app.bundleURL?.lastPathComponent ?? "").lowercased()
+    let bid = (app.bundleIdentifier ?? "").lowercased()
+    return name.contains(q) || file.hasPrefix(q) || file == q + ".app" || bid == q
+}
+
 func openApp(_ args: [String: Any]) -> Never {
     guard let query = args["query"] as? String, !query.isEmpty else { fail("openapp 需要 query") }
     let ws = NSWorkspace.shared
 
     if query.contains(".") {
-        if let app = ws.runningApplications.first(where: { $0.bundleIdentifier == query }) {
+        if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
             app.activate(options: [.activateAllWindows])
             ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
         }
         if let url = ws.urlForApplication(withBundleIdentifier: query),
            ws.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) != nil {
             usleep(900_000)
-            let app = ws.runningApplications.first(where: { $0.bundleIdentifier == query })
+            let app = ws.runningApplications.first(where: { appMatches($0, query) })
             ok(["pid": app?.processIdentifier ?? 0, "name": app?.localizedName ?? query, "activated": false])
         }
         fail("无法启动应用 bundleId: \(query)", code: "APP_LAUNCH_FAILED")
     }
 
-    if let app = ws.runningApplications.first(where: { ($0.localizedName ?? "").lowercased() == query.lowercased() }) {
+    if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
+        app.activate(options: [.activateAllWindows])
+        ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
+    }
+
+    // Launch by name via LaunchServices (`open -a`), which activates the app.
+    let openProc = Process()
+    openProc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    openProc.arguments = ["-a", query]
+    try? openProc.run()
+    openProc.waitUntilExit()
+    usleep(900_000)
+    if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
         app.activate(options: [.activateAllWindows])
         ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
     }
@@ -447,6 +477,8 @@ let parsed = parseArgs(jsonArgs)
 switch command {
 case "permissions":
     ok(checkPermissions())
+case "requestpermissions":
+    requestPermissions()
 case "screenshot":
     screenshot()
 case "listWindows":
