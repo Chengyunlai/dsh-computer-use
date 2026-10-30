@@ -108,7 +108,7 @@ export class BrowserDriver {
           const value = el.value
           const text = (typeof value === 'string' && value.length > 0
             ? value
-            : (el.innerText ?? el.getAttribute('aria-label') ?? el.placeholder ?? el.textContent ?? ''))
+            : (el.innerText || el.getAttribute('aria-label') || el.placeholder || el.textContent || ''))
             .trim().replace(/\s+/g, ' ').slice(0, 200)
           const item = {
             tag: el.tagName.toLowerCase(),
