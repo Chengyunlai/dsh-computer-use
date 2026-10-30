@@ -6,3 +6,4 @@ native/macos-helper
 demos/frames/
 docs/demos/desktop*.gif
 demos/desktop*.gif
+.playwright-mcp/

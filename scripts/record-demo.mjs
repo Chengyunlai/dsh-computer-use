@@ -8,13 +8,15 @@
  *
  * Usage:  node scripts/record-demo.mjs <case>
  *   cases: figma | wikipedia | github
- * Frames:  demos/frames/<case>/frame-%04d.png
+ * Frames:  .playwright-mcp/<case>-<run>/frame-%04d.png
  * Then:    ffmpeg -y -framerate 3 -i demos/frames/<case>/frame-%04d.png \
  *            -vf "scale=800:-2:flags=lanczos" -loop 0 demos/<case>.gif
  */
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BrowserDriver } from '../drivers/browser.js'
+import { recordWikipedia } from './wikipedia-scenario.mjs'
+import { mkdtemp } from 'node:fs/promises'
 
 const CASES = {
   figma: {
@@ -29,18 +31,7 @@ const CASES = {
       ['wait', 500],
     ],
   },
-  wikipedia: {
-    url: 'https://en.wikipedia.org',
-    steps: [
-      ['wait', 2000],
-      ['findAndClick', 'input:Search'],
-      ['wait', 500],
-      ['type', 'Playwright'],
-      ['wait', 600],
-      ['press', 'Enter'],
-      ['wait', 2600],
-    ],
-  },
+  wikipedia: { url: 'https://en.wikipedia.org' },
   github: {
     url: 'https://github.com/deepseek-ai/deepseek-harness',
     steps: [
@@ -68,8 +59,8 @@ const driver = new BrowserDriver({
   viewport: { width: 1280, height: 800 },
 })
 
-const dir = join('demos', 'frames', which)
-await mkdir(dir, { recursive: true })
+await mkdir('.playwright-mcp', { recursive: true })
+const dir = await mkdtemp(join('.playwright-mcp', which + '-'))
 let frame = 0
 
 async function snap() {
@@ -103,6 +94,9 @@ try {
   await driver.ensure()
   console.log(`case ${which}: opening ${scenario.url}`)
   await driver.open(scenario.url)
+  if (which === 'wikipedia') {
+    await recordWikipedia(driver, snap)
+  } else {
   await snap()
 
   for (const [op, arg] of scenario.steps) {
@@ -147,6 +141,7 @@ try {
 
   await driver.wait(700)
   await snap()
+  }
 } finally {
   await driver.close()
   console.log(`done — ${frame} frames in ${dir}`)

@@ -6,13 +6,15 @@ A Cordis plugin for browser and macOS desktop interaction in DeepSeek Harness. T
 
 ## Demos
 
-These GIFs use an isolated browser and public websites:
+These GIFs are scripted runs of the plugin’s own BrowserDriver in an isolated browser on public websites; no model round ran:
 
 | Scenario | Demo |
 |---|---|
 | Figma website | ![Figma](docs/demos/figma.gif) |
-| Wikipedia search | ![Wikipedia](docs/demos/wikipedia.gif) |
+| Wikipedia: search for the Playwright software article | ![Wikipedia](docs/demos/wikipedia-search.gif) |
 | GitHub browsing | ![GitHub](docs/demos/github.gif) |
+
+The Wikipedia GIF shows four verified states: the homepage, focused search field, entered `Playwright (software)` query, and destination article. Holds are 1, 0.5, 2 and 4 seconds for presentation, not response-latency measurements. Reproduce with `node scripts/record-demo.mjs wikipedia` after installing dependencies in the plugin directory; frames are saved under `.playwright-mcp/`.
 
 Run `node test/driver.desktop.e2e.mjs` locally to exercise Calculator through Accessibility (`7 + 3 = 10`), verify focus and pointer position, and capture the target window. Desktop recordings are ignored by Git.
 
@@ -62,7 +64,7 @@ The first command checks missing targets, vanished windows without display fallb
 
 ## Data removal
 
-This repository remains private while private content from a historical desktop recording is being removed. Deleting the current file and rewriting history do not guarantee removal of cached objects. Contact GitHub Support using [GitHub's sensitive-data removal procedure](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository). Do not automatically upload desktop recordings or make the repository public again.
+Desktop screenshots and recordings are not uploaded automatically. Deleting the current file and rewriting history do not guarantee removal of cached objects. Contact GitHub Support using [GitHub's sensitive-data removal procedure](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository). Public repository visibility does not establish that historical objects or caches have been purged.
 
 ## License
 
