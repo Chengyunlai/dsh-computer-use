@@ -35,8 +35,8 @@ const CASES = {
       ['wait', 2000],
       ['findAndClick', 'input:Search'],
       ['wait', 500],
-      ['type', 'Computer use'],
-      ['wait', 500],
+      ['type', 'Playwright'],
+      ['wait', 600],
       ['press', 'Enter'],
       ['wait', 2600],
     ],
@@ -86,10 +86,13 @@ function center(el) {
 async function find(needle) {
   const state = await driver.getState()
   const [kind, text] = needle.split(':')
-  const target = kind === 'input' ? (text ?? '').toLowerCase() : needle.toLowerCase()
+  // 'input' / 'button' without a suffix match any element of that tag;
+  // 'input:Search' additionally filters by visible text.
+  const target = (kind === 'input' || kind === 'button') ? (text ?? '').toLowerCase() : needle.toLowerCase()
   const el = state.elements.find((e) => {
     const t = e.text || ''
     if (kind === 'input') return e.tag === 'input' && t.toLowerCase().includes(target)
+    if (kind === 'button') return e.tag === 'button' && t.toLowerCase().includes(target)
     return t.toLowerCase().includes(target)
   })
   if (!el) throw new Error(`element matching '${needle}' not found`)
