@@ -9,14 +9,13 @@
  * Usage:  node scripts/record-demo.mjs <case>
  *   cases: figma | wikipedia | github
  * Frames:  .playwright-mcp/<case>-<run>/frame-%04d.png
- * Then:    ffmpeg -y -framerate 3 -i demos/frames/<case>/frame-%04d.png \
+ * Then:    ffmpeg -y -framerate 3 -i .playwright-mcp/<case>-<run>/frame-%04d.png \
  *            -vf "scale=800:-2:flags=lanczos" -loop 0 demos/<case>.gif
  */
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, writeFile, mkdtemp } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BrowserDriver } from '../drivers/browser.js'
 import { recordWikipedia } from './wikipedia-scenario.mjs'
-import { mkdtemp } from 'node:fs/promises'
 
 const CASES = {
   figma: {
@@ -97,50 +96,50 @@ try {
   if (which === 'wikipedia') {
     await recordWikipedia(driver, snap)
   } else {
-  await snap()
-
-  for (const [op, arg] of scenario.steps) {
-    switch (op) {
-      case 'wait':
-        await driver.wait(arg)
-        break
-      case 'findAndClick': {
-        let el = await find(arg)
-        for (let i = 0; i < 4 && (el.box.y > 620 || el.box.y < 120); i++) {
-          const dy = Math.round(el.box.y - 300)
-          await driver.scroll(640, 400, 0, dy)
-          await driver.wait(250)
-          el = await find(arg)
-        }
-        const [x, y] = center(el)
-        console.log(`clicking '${el.text || el.tag}' at (${x}, ${y})`)
-        await driver.click(x, y, { button: 'left' })
-        const url = (await driver.describe()).url
-        console.log(`  -> ${url}`)
-        break
-      }
-      case 'type': {
-        const el = await find('input')
-        const [x, y] = center(el)
-        await driver.click(x, y, { button: 'left' })
-        await driver.type(arg)
-        console.log(`typed '${arg}'`)
-        break
-      }
-      case 'press':
-        await driver.keypress(arg)
-        console.log(`pressed ${arg}`)
-        break
-      case 'scroll':
-        await driver.scroll(640, 400, 0, arg)
-        console.log(`scrolled ${arg}px`)
-        break
-    }
     await snap()
-  }
 
-  await driver.wait(700)
-  await snap()
+    for (const [op, arg] of scenario.steps) {
+      switch (op) {
+        case 'wait':
+          await driver.wait(arg)
+          break
+        case 'findAndClick': {
+          let el = await find(arg)
+          for (let i = 0; i < 4 && (el.box.y > 620 || el.box.y < 120); i++) {
+            const dy = Math.round(el.box.y - 300)
+            await driver.scroll(640, 400, 0, dy)
+            await driver.wait(250)
+            el = await find(arg)
+          }
+          const [x, y] = center(el)
+          console.log(`clicking '${el.text || el.tag}' at (${x}, ${y})`)
+          await driver.click(x, y, { button: 'left' })
+          const url = (await driver.describe()).url
+          console.log(`  -> ${url}`)
+          break
+        }
+        case 'type': {
+          const el = await find('input')
+          const [x, y] = center(el)
+          await driver.click(x, y, { button: 'left' })
+          await driver.type(arg)
+          console.log(`typed '${arg}'`)
+          break
+        }
+        case 'press':
+          await driver.keypress(arg)
+          console.log(`pressed ${arg}`)
+          break
+        case 'scroll':
+          await driver.scroll(640, 400, 0, arg)
+          console.log(`scrolled ${arg}px`)
+          break
+      }
+      await snap()
+    }
+
+    await driver.wait(700)
+    await snap()
   }
 } finally {
   await driver.close()
