@@ -46,7 +46,7 @@ To add the helper path: click **"+"** in the list, press `Cmd+Shift+G` in the fi
 ```yaml
 - id: computer-use
   config:
-    driver: desktop          # or browser (default)
+    mode: auto               # default: URL -> browser driver, app name -> desktop driver; actions follow the active surface
     desktop:
       helperPath: null       # defaults to native/macos-helper in the repo
       inputMode: background  # background (default; no real mouse movement, no focus steal) | global (real CGEvent mouse)
@@ -99,12 +99,14 @@ The plugin row `computer-use` activates with `driver: browser` by default. Examp
 - id: computer-use
   name: '@local/dsh-computer-use'
   config:
-    driver: browser
+    mode: auto               # auto (default; URL -> browser, app name -> desktop, switch freely) | browser | desktop
     browser:
       channel: chrome        # reuse system Chrome; or set executablePath / headless
       headless: false
       viewport: { width: 1280, height: 800 }
       blockExternal: false   # true = abort cross-origin requests
+    desktop:
+      inputMode: background  # background (default; no real mouse movement, no focus steal) | global
     screenshotDir: computer-use/screenshots
 ```
 

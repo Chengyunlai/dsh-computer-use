@@ -9,14 +9,19 @@
  * tool and the driver; no model loop is reimplemented here.
  */
 import Schema from '@deepseek-ai/schemastery'
-import { BrowserDriver } from './drivers/browser.js'
-import { DesktopDriver } from './drivers/desktop.js'
+import { ComputerRouter } from './drivers/router.js'
 import { renderComputerResult, captureScreenshot } from './lib/screenshot.js'
 import { guidance } from './lib/guidance.js'
 
 export const Config = Schema.object({
-  /** Which driver serves the computer_use tool. 'browser' is the working v1. */
-  driver: Schema.union(['browser', 'desktop']).default('browser'),
+  /**
+   * 'auto' (default): open() routes by target — URLs go to the browser
+   * driver, anything else (an app name) goes to the macOS desktop driver,
+   * and observation/actions follow whichever surface is active. The agent
+   * can operate a browser, a desktop app, the file manager, and system
+   * settings in one session. 'browser' / 'desktop' pin one surface.
+   */
+  mode: Schema.union(['auto', 'browser', 'desktop']).default('auto'),
   browser: Schema.object({
     /** Playwright browser channel; 'chrome' reuses the installed Google Chrome. */
     channel: Schema.string().default('chrome'),
@@ -32,8 +37,14 @@ export const Config = Schema.object({
     blockExternal: Schema.boolean().default(false),
   }).default({}),
   desktop: Schema.object({
-    /** Reserved for a future native desktop helper (macOS Accessibility/ScreenCaptureKit bridge). */
+    /** Absolute path to the native helper; defaults to native/macos-helper in this package. */
     helperPath: Schema.string(),
+    /**
+     * 'background' (default): operate apps without moving the real mouse or
+     * stealing focus (AX press / pid-targeted events). 'global': classic
+     * CGEvent injection that moves the real pointer.
+     */
+    inputMode: Schema.union(['background', 'global']).default('background'),
   }).default({}),
   /** Where viewport screenshots are also saved for the user, relative to the harness working directory. */
   screenshotDir: Schema.string().default('computer-use/screenshots'),
@@ -49,7 +60,7 @@ const TOOL_SCHEMA = {
       enum: ACTIONS,
       description: [
         'Which computer operation to perform.',
-        'open: navigate the browser to `url` (starts the session).',
+        'open: `url` (http/https/file/data) opens in the browser; an `app` name (e.g. Calculator, Finder) opens on the desktop. Auto-routes.',
         'screenshot: capture the current viewport and return its image; coordinates in later actions use this image\'s pixels.',
         'get_state: return the current page url/title and a list of interactive elements with their on-screen boxes.',
         'click: click at pixel (`x`, `y`); optional `button` (left|right|middle), `clickCount`, `holdMs`.',
@@ -57,10 +68,11 @@ const TOOL_SCHEMA = {
         'keypress: press a key or chord, e.g. "Enter", "Tab", "Control+A", "Meta+Shift+P".',
         'scroll: move the pointer to (`x`, `y`) and wheel by (`deltaX`, `deltaY`).',
         'wait: wait `ms` milliseconds for the page to settle (default 1000).',
-        'close: close the browser session.',
+        'close: end the current session (browser or desktop).',
       ].join(' '),
     },
-    url: { type: 'string', description: 'Destination URL for action=open. http(s), file, or data: URLs are accepted.' },
+        url: { type: 'string', description: 'Destination for action=open: a web URL (http/https/file/data) or a macOS app name (e.g. Calculator, Finder, System Settings).' },
+    app: { type: 'string', description: 'macOS application name for action=open (alternative to `url`).' },
     x: { type: 'integer', description: 'Horizontal pixel coordinate in the last screenshot (action=screenshot/click/scroll).' },
     y: { type: 'integer', description: 'Vertical pixel coordinate in the last screenshot (action=screenshot/click/scroll).' },
     button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button for action=click. Defaults to left.' },
@@ -85,10 +97,13 @@ export function apply(ctx, config) {
     const key = execution.agent?.id ?? 'host'
     let session = sessions.get(key)
     if (session) return { key, session }
-    const driver = config.driver === 'desktop'
-      ? new DesktopDriver({ ...config.desktop, logger })
-      : new BrowserDriver({ ...config.browser, logger, screenshotDir: config.screenshotDir })
-    session = { driver, createdAt: Date.now() }
+    const router = new ComputerRouter({
+      mode: config.mode,
+      browser: { ...config.browser, screenshotDir: config.screenshotDir },
+      desktop: config.desktop,
+      logger,
+    })
+    session = { driver: router, createdAt: Date.now() }
     sessions.set(key, session)
     return { key, session }
   }
@@ -104,67 +119,64 @@ export function apply(ctx, config) {
     }
   }
 
-  async function withDriver(execution, key, session, action, args) {
-    if (action === 'close') {
-      await closeSession(key)
-      return { ok: true }
-    }
-    const driver = session.driver
+  async function withRouter(execution, key, session, action, args) {
+    const router = session.driver
     const signal = execution.signal
     switch (action) {
       case 'open': {
-        if (typeof args.url !== 'string' || args.url.length === 0) throw new Error('action=open requires a `url` string')
-        await driver.ensure()
-        await driver.open(args.url, signal)
-        return driver.describe()
+        const target = typeof args.url === 'string' && args.url.length > 0
+          ? args.url
+          : (typeof args.app === 'string' && args.app.length > 0 ? args.app : null)
+        if (!target) throw new Error('action=open requires a `url` (web) or an `app` (macOS application)')
+        return router.open(target, signal)
       }
       case 'screenshot':
-        return captureScreenshot(ctx, execution, driver)
+        return captureScreenshot(ctx, execution, router)
       case 'get_state':
-        await driver.ensure()
-        return driver.getState()
+        return router.getState()
       case 'click': {
         const x = Number(args.x); const y = Number(args.y)
         if (!Number.isInteger(x) || !Number.isInteger(y)) throw new Error('action=click requires integer `x` and `y`')
-        await driver.ensure()
-        return driver.click(x, y, {
+        return router.click(x, y, {
           button: args.button ?? 'left', clickCount: args.clickCount ?? 1, holdMs: args.holdMs,
         })
       }
       case 'type': {
         if (typeof args.text !== 'string') throw new Error('action=type requires a `text` string')
-        await driver.ensure()
-        return driver.type(args.text)
+        return router.type(args.text)
       }
       case 'keypress': {
         if (typeof args.key !== 'string' || args.key.length === 0) throw new Error('action=keypress requires a `key` string')
-        await driver.ensure()
-        return driver.keypress(args.key)
+        return router.keypress(args.key)
       }
       case 'scroll': {
         const x = Number(args.x); const y = Number(args.y)
         if (!Number.isInteger(x) || !Number.isInteger(y)) throw new Error('action=scroll requires integer `x` and `y`')
-        await driver.ensure()
-        return driver.scroll(x, y, args.deltaX ?? 0, args.deltaY ?? 0)
+        return router.scroll(x, y, args.deltaX ?? 0, args.deltaY ?? 0)
       }
       case 'wait': {
         const ms = Number(args.ms ?? 1000)
-        await driver.ensure()
-        return driver.wait(ms)
+        return router.wait(ms)
       }
+      case 'close':
+        await closeSession(key)
+        return { ok: true }
       default:
-        throw new Error(`action '${action}' is not supported by the ${config.driver} driver`)
+        throw new Error(`action '${action}' is not supported`)
     }
   }
 
   const tool = {
     name: 'computer_use',
     description: [
-      'Observe and operate the computer like a human user. Drives a live browser (or a desktop session when configured):',
-      'take a screenshot of the current view, click at pixel coordinates, type text, press keys, scroll, and read interactive page state.',
-      'Coordinate space: all x/y values are pixels of the image returned by the most recent action=screenshot call; that image is the ground truth.',
-      'Workflow: screenshot → act → screenshot again to verify the result. Prefer get_state when locating elements precisely.',
-      'The session is a private, isolated browser; action=close ends it.',
+      'Observe and operate the computer like a human user — a browser, a desktop app, the file manager, or system settings,',
+      'switching freely within one task. action=open routes automatically: a URL opens in the private browser driver; an app name',
+      '(e.g. "Calculator", "Finder", "系统设置") opens in the macOS desktop driver (background AX input by default: the real mouse',
+      'and keyboard focus are untouched). Screenshot the current view, click at pixel coordinates, type, press keys, scroll, and read',
+      'interactive state; every observation/action follows the surface opened last (get_state reports the current `surface`).',
+      'Coordinate space: x/y are pixels of the most recent screenshot image, top-left origin; that image is the ground truth.',
+      'Workflow: open → screenshot → act → screenshot again to verify. Prefer get_state when locating elements precisely.',
+      'action=close ends the current session.',
     ].join(' '),
     parameters: TOOL_SCHEMA,
     output: {
@@ -181,7 +193,7 @@ export function apply(ctx, config) {
       }
       const { key, session } = sessionFor(execution)
       try {
-        return await withDriver(execution, key, session, action, args ?? {})
+        return await withRouter(execution, key, session, action, args ?? {})
       } finally {
         if (action === 'close') await closeSession(key)
       }
@@ -205,5 +217,5 @@ export function apply(ctx, config) {
     for (const key of [...sessions.keys()]) void closeSession(key)
   })
 
-  logger.info('computer_use plugin active (driver=%s)', config.driver)
+  logger.info('computer_use plugin active (mode=%s)', config.mode)
 }

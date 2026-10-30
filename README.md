@@ -45,7 +45,7 @@ helper 需要两项系统权限，在 **系统设置 → 隐私与安全性** �
 ```yaml
 - id: computer-use
   config:
-    driver: desktop          # 或 browser（默认）
+    mode: auto               # 默认：URL→浏览器驱动，应用名→桌面驱动，观察/操作跟随当前面
     desktop:
       helperPath: null       # 默认用仓库内 native/macos-helper
       inputMode: background  # background（默认，不移动真实鼠标/不抢焦点）| global（真实 CGEvent 鼠标）
@@ -97,12 +97,14 @@ npm install
 - id: computer-use
   name: '@local/dsh-computer-use'
   config:
-    driver: browser
+    mode: auto               # auto（默认，URL→浏览器、应用名→桌面，自由切换）| browser | desktop
     browser:
       channel: chrome        # 复用系统 Chrome；也可指定 executablePath / headless
       headless: false
       viewport: { width: 1280, height: 800 }
       blockExternal: false   # true = 中断跨源请求
+    desktop:
+      inputMode: background  # background（默认，不移动真实鼠标/不抢焦点）| global
     screenshotDir: computer-use/screenshots
 ```
 
