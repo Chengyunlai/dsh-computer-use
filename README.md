@@ -1,4 +1,4 @@
-# dsh-computer-use-plugin
+# dsh-computer-use · DeepSeek Harness 计算机操作插件
 
 [English](README.en.md) · [MIT](LICENSE)
 
