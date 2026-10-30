@@ -3,7 +3,6 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Playwright](https://img.shields.io/badge/driver-Playwright-2f9e44)](drivers/browser.js)
 [![DSH](https://img.shields.io/badge/DeepSeek%20Harness-0.2.1--rc.3%2B-4b6bfe)](https://github.com/deepseek-ai/deepseek-harness)
-
 **为 DeepSeek Harness 打造的 Computer Use 插件——让 Agent 像人一样观察并操作真实浏览器。**
 
 一个 Cordis 插件，为 DeepSeek Harness 的 Agent 提供 `computer_use` 工具：截取当前视图、按像素坐标点击、输入文本、按键、滚动、读取可交互页面状态。Agent 自主完成 **观察 → 决策 → 操作 → 验证** 的完整闭环——不需要 PyAutoGUI，也不需要预先写死的坐标。
@@ -15,8 +14,48 @@
 | 场景 | 演示 | 用到的动作 |
 |---|---|---|
 | **浏览官网并交互** · figma.com | ![figma.com 演示](docs/demos/figma.gif) | `open` → `screenshot` → `get_state` 定位 → `click` 关闭 Cookie 横幅 → `scroll` |
-| **搜索并输入** · Wikipedia | ![Wikipedia 演示](docs/demos/wikipedia.gif) | `click` 搜索框 → `type` "Computer use" → `keypress` Enter → 结果页 |
+| **搜索并输入** · Wikipedia | ![Wikipedia 演示](docs/demos/wikipedia.gif) | `click` 搜索框 → `type` "Playwright" → `keypress` Enter → 直达词条 |
 | **仓库多步浏览** · deepseek-harness | ![GitHub 演示](docs/demos/github.gif) | `click` 进入 `packages` 目录 → `click` 打开 `README.md` → `scroll` |
+
+## macOS 桌面驱动（真实鼠标 · 系统理解）
+
+除了浏览器，`computer_use` 还能以 **desktop** 模式驱动 macOS 桌面：整屏截图、**真实鼠标/键盘事件**（CGEvent）、通过辅助功能 API 读取**应用/窗口/元素状态**、启动并激活应用。演示（真实操作计算器，`7 + 3 =`）：
+
+![桌面演示](docs/demos/desktop-calculator.gif)
+
+实现：原生 Swift helper（`native/macos-helper.swift`），编译：
+
+```bash
+./native/build.sh   # 需要 Xcode Command Line Tools
+```
+
+### 系统权限（一次性）
+
+helper 需要两项系统权限，在 **系统设置 → 隐私与安全性** 中授予：
+
+| 权限 | 作用 | 授予对象 |
+|---|---|---|
+| 辅助功能 (Accessibility) | 鼠标/键盘事件、AX 元素读取 | 勾选 **DeepSeek Harness**，或添加 helper 路径 |
+| 屏幕录制 (Screen Recording) | ScreenCaptureKit 截图 | 同上 |
+
+添加 helper 路径：列表左下角 **"+"** → 文件选择器按 `Cmd+Shift+G` → 输入 `<仓库>/native/macos-helper` → 打开。授权后重新打开 DeepSeek Harness（部分权限需应用重启生效）。
+
+### 配置与动作语义
+
+```yaml
+- id: computer-use
+  config:
+    driver: desktop          # 或 browser（默认）
+    desktop:
+      helperPath: null       # 默认用仓库内 native/macos-helper
+```
+
+desktop 模式下 `computer_use` 的动作：
+
+- `open`：`http(s)://` 用默认浏览器打开；否则按名称 / bundleId 启动并**激活**应用（如 `Calculator`）
+- `screenshot`：整屏截图（物理像素）；坐标空间 = 截图像素，Retina 缩放由驱动自动换算
+- `get_state`：前台应用、窗口、可交互元素（role / label / 框坐标）+ 系统窗口列表
+- `click` / `type` / `keypress` / `scroll`：真实系统事件
 
 ## 它做什么
 
@@ -125,13 +164,13 @@ computer-use/
 - **独立 e2e**（`test/driver.e2e.mjs`）：open / screenshot（1280×800 PNG）/ get_state（无损 JSON）/ 点击展开 / 输入 / 点击保存 / 状态翻转 + 输入值回读 / keypress / scroll —— 在本地演示页（`test-page.html`）上**全部通过**。
 - **Harness 内闭环**：lead agent 实际调用 `computer_use` 全流程——打开演示页、截图、`get_state` 拿元素框坐标、点击"查看任务详情"、输入 `hello computer use`、点击"保存备注"，再用第二次 `get_state` 确认状态翻转为"任务状态：已经完成"且输入框保留文本。
 - **真实站点操作**：同一套工具驱动了 figma.com（打开、点击 *Allow all cookies* 关横幅、滚动）与 Wikipedia / GitHub 的多步操作，上方 GIF 即来自这些录制。
-- **已知限制**：文本模型路由（如未声明 image 输入的 `deepseek-v4-flash`）下截图回退为文件路径；换成图像模型即可收到内联图像内容块。
+- **桌面驱动 e2e**（`test/driver.desktop.e2e.mjs`）：启动计算器 → AX 定位 `7 / 加 / 3 / 等于` 按钮 → 真实鼠标点击 → 计算器显示 `10` —— **通过**（中文系统，运算符 label 为"加/等于"，AX 理解正常）。
+- **已知限制**：文本模型路由（如未声明 image 输入的 `deepseek-v4-flash`）下截图回退为文件路径；换成图像模型即可收到内联图像内容块。桌面截图需要屏幕录制权限。
 
 ## Roadmap
 
-- **macOS 桌面驱动** —— 真正 Computer Use 最有意思的部分：需要 Accessibility API（`AXUIElement`）带元素索引的快照、ScreenCaptureKit/CGWindowList 截图、以及不抢占全局焦点的按应用事件路由。官方 DSH 正在做 `packages/experimental/cua`（原生 helper + 权限 UI），尚未发布到 npm；发布后本插件的浏览器驱动可与它组合。
+- **桌面驱动深化** —— macOS MVP 已完成（真实鼠标/键盘 + AX 系统理解）。剩余：**不抢占全局焦点的按应用事件路由**、**多 Agent 窗口并发**（每个 Agent 一个独立窗口上下文）、Windows 支持。官方 DSH 的 `packages/experimental/cua`（原生 helper + 权限 UI）发布后可与本插件组合。
 - **高风险操作审批**（删除/付款/发送）—— 通过 `ctx.tools.guard()` 接入。
-- **多 Agent 窗口并发** —— 目前已做到每 Agent 一个隔离浏览器；窗口级隔离属于桌面驱动里程碑。
 
 ## 相关
 

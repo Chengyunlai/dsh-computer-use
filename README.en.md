@@ -15,8 +15,48 @@ GIFs of three real-world scenarios, all recorded by the plugin's own driver (the
 | Scenario | Demo | Actions used |
 |---|---|---|
 | **Browse & interact** · figma.com | ![figma.com demo](docs/demos/figma.gif) | `open` → `screenshot` → `get_state` to locate → `click` to dismiss the cookie banner → `scroll` |
-| **Search & type** · Wikipedia | ![Wikipedia demo](docs/demos/wikipedia.gif) | `click` the search box → `type` "Computer use" → `keypress` Enter → results page |
+| **Search & type** · Wikipedia | ![Wikipedia demo](docs/demos/wikipedia.gif) | `click` the search box → `type` "Playwright" → `keypress` Enter → straight to the article |
 | **Multi-step repo browsing** · deepseek-harness | ![GitHub demo](docs/demos/github.gif) | `click` into the `packages` folder → `click` to open `README.md` → `scroll` |
+
+## macOS desktop driver (real mouse · system understanding)
+
+Besides the browser, `computer_use` can drive the macOS desktop in **desktop** mode: full-screen captures, **real mouse/keyboard events** (CGEvent), app/window/element state via the Accessibility API, and launching/activating apps. Demo (operating the real Calculator, `7 + 3 =`):
+
+![desktop demo](docs/demos/desktop-calculator.gif)
+
+Implementation: a native Swift helper (`native/macos-helper.swift`); build with:
+
+```bash
+./native/build.sh   # requires Xcode Command Line Tools
+```
+
+### System permissions (one-time)
+
+The helper needs two permissions in **System Settings → Privacy & Security**:
+
+| Permission | Purpose | Grant to |
+|---|---|---|
+| Accessibility | mouse/keyboard events, AX element reads | tick **DeepSeek Harness**, or add the helper path |
+| Screen Recording | ScreenCaptureKit captures | same |
+
+To add the helper path: click **"+"** in the list, press `Cmd+Shift+G` in the file picker, enter `<repo>/native/macos-helper`, open. Reopen DeepSeek Harness afterwards (some permissions need an app restart).
+
+### Config & action semantics
+
+```yaml
+- id: computer-use
+  config:
+    driver: desktop          # or browser (default)
+    desktop:
+      helperPath: null       # defaults to native/macos-helper in the repo
+```
+
+In desktop mode the `computer_use` actions are:
+
+- `open`: `http(s)://` opens in the default browser; otherwise launches and **activates** an app by name / bundleId (e.g. `Calculator`)
+- `screenshot`: full-screen capture (physical pixels); coordinates are screenshot pixels, Retina scaling is handled by the driver
+- `get_state`: frontmost app, window, interactive elements (role / label / box) plus the system window list
+- `click` / `type` / `keypress` / `scroll`: real system events
 
 ## What it does
 
@@ -126,13 +166,13 @@ Honest status, verified on 2026-10-30 against DeepSeek Harness 0.2.1-rc.3:
 - **Standalone e2e** (`test/driver.e2e.mjs`): open / screenshot (1280×800 PNG) / get_state (lossless JSON) / click-to-expand / type / click-to-save / status flip + input value readback / keypress / scroll — **all pass** on the local demo page (`test-page.html`).
 - **In-harness loop**: the lead agent actually called `computer_use` end to end — opened the demo page, screenshot, `get_state` → element boxes, clicked *查看任务详情*, typed `hello computer use`, clicked *保存备注*, and verified via a second `get_state` that the status flipped to *任务状态：已经完成* and the input kept the typed text.
 - **Real-world operation**: the same tool drove figma.com (open, click *Allow all cookies* to dismiss the banner, scroll) plus multi-step Wikipedia / GitHub runs — the GIFs above are those recordings.
-- **Known limitation**: with a text-only model route (e.g. `deepseek-v4-flash` without image input declared), screenshots fall back to file paths; switch to an image-capable model to receive inline image content blocks.
+- **Desktop driver e2e** (`test/driver.desktop.e2e.mjs`): launch Calculator → locate the `7 / + / 3 / =` buttons via AX → real mouse clicks → Calculator shows `10` — **passed** (on a Chinese-system macOS, operator labels are 加/等于; AX understanding works).
+- **Known limitation**: with a text-only model route (e.g. `deepseek-v4-flash` without image input declared), screenshots fall back to file paths; switch to an image-capable model to receive inline image content blocks. Desktop captures additionally require the Screen Recording permission.
 
 ## Roadmap
 
-- **macOS desktop driver** — the interesting part of real Computer Use. Needs Accessibility API (`AXUIElement`) snapshots with element indices, ScreenCaptureKit/CGWindowList capture, and per-application event routing so agents operate apps without stealing global focus. The official DSH project is building this as `packages/experimental/cua` (native helper + permission UI) — not published to npm yet; when it ships, this plugin's browser driver composes alongside it.
+- **Desktop driver deepening** — the macOS MVP is done (real mouse/keyboard + AX system understanding). Remaining: **per-application event routing without stealing global focus**, **multi-agent window concurrency** (one window context per agent), and Windows support. The official DSH `packages/experimental/cua` (native helper + permission UI) can compose with this plugin once it ships.
 - **Approval guards** for high-risk actions (delete / pay / send) via `ctx.tools.guard()`.
-- **Multi-agent window concurrency** — one isolated browser per agent already; window-level isolation is the desktop-driver milestone.
 
 ## Related
 
