@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>Computer Use 测试页</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    button { padding: .5rem 1rem; }
+    input { padding: .4rem; width: 18rem; }
+    #result { color: #0a7a2f; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>任务面板</h1>
+  <details id="task">
+    <summary>查看任务详情</summary>
+    <p>任务状态：<span id="status">进行中</span></p>
+  </details>
+  <p><input id="note" placeholder="输入备注…"></p>
+  <p><button id="save">保存备注</button></p>
+  <p id="result"></p>
+  <script>
+    document.getElementById('save').addEventListener('click', function () {
+      const value = document.getElementById('note').value
+      document.getElementById('result').textContent = '已保存：' + value
+      document.getElementById('status').textContent = '已经完成'
+    })
+  </script>
+</body>
+</html>

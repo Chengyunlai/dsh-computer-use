@@ -1,0 +1,14 @@
+# @local/dsh-computer-use bundle patch: one host row exposing the computer_use tool.
+- insert:
+    - id: computer-use
+      name: '@local/dsh-computer-use'
+      config:
+        driver: browser
+        browser:
+          channel: chrome
+          headless: false
+          viewport:
+            width: 1280
+            height: 800
+        desktop:
+          helperPath: null
