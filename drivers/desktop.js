@@ -108,7 +108,7 @@ export class DesktopDriver {
       }
     }
     const scale = this.scale
-    const elements = (ax.elements ?? []).map((el) => {
+    let elements = (ax.elements ?? []).map((el) => {
       const b = el.box ?? {}
       return {
         role: el.role,
@@ -122,6 +122,43 @@ export class DesktopDriver {
         },
       }
     }).filter((el) => el.box.width > 0 && el.box.height > 0)
+
+    // OCR fallback: apps that expose no Accessibility tree (e.g. Electron)
+    // are read visually — recognized text with pixel boxes, filtered to the
+    // target window's region. Clicking these elements falls back to
+    // coordinate input (they have no AX press target).
+    if (elements.length === 0 && pid) {
+      try {
+        const ocr = await this.#run('ocr')
+        const win = (windows.windows ?? []).find((w) => w.pid === pid)
+        const wb = win?.bounds
+        const ox = wb ? wb.x * scale : -1e9
+        const oy = wb ? wb.y * scale : -1e9
+        const ow = wb ? wb.width * scale : 1e9
+        const oh = wb ? wb.height * scale : 1e9
+        elements = (ocr.items ?? []).map((item) => {
+          const b = item.box ?? {}
+          return {
+            role: 'text',
+            text: item.text ?? '',
+            source: 'ocr',
+            box: {
+              x: Math.round(b.x ?? 0),
+              y: Math.round(b.y ?? 0),
+              width: Math.round(b.width ?? 0),
+              height: Math.round(b.height ?? 0),
+            },
+          }
+        }).filter((el) => {
+          if (el.box.width <= 0 || el.box.height <= 0) return false
+          const cx = el.box.x + el.box.width / 2
+          const cy = el.box.y + el.box.height / 2
+          return cx >= ox - 40 && cx <= ox + ow + 40 && cy >= oy - 40 && cy <= oy + oh + 40
+        })
+      } catch {
+        // OCR is best-effort; keep an empty element list when it fails
+      }
+    }
     this.lastElements = elements
     const window = ax.window ? {
       title: ax.window.title ?? '',
@@ -185,6 +222,15 @@ export class DesktopDriver {
       // works while the app is in the background, without moving the pointer.
       const target = this.#nearestElement(x, y)
       if (target && this.targetPid) {
+        if (target.source === 'ocr') {
+          // OCR-recognized text has no AX press target; click by coordinates
+          // via postToPid (virtual, does not move the real pointer). Targeted
+          // events reach Electron apps only while they are frontmost.
+          const sx = Math.round(x / this.scale)
+          const sy = Math.round(y / this.scale)
+          await this.#run('click', { x: sx, y: sy, pid: this.targetPid })
+          return { ok: true, x, y, via: 'postToPid', element: target.text, button, clickCount }
+        }
         for (let i = 0; i < clickCount; i++) {
           await this.#run('axpress', { pid: this.targetPid, label: target.text })
           if (i < clickCount - 1) await new Promise((r) => setTimeout(r, 150))

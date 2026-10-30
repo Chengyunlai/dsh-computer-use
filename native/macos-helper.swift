@@ -16,6 +16,7 @@ import ApplicationServices
 import AppKit
 import ScreenCaptureKit
 import UniformTypeIdentifiers
+import Vision
 
 // MARK: - JSON plumbing
 
@@ -88,7 +89,7 @@ final class ScreenCapturer: NSObject, SCStreamOutput {
     }
 }
 
-func screenshot() -> Never {
+func captureContent(windowId: CGWindowID? = nil) -> (CGImage, Double) {
     let perms = checkPermissions()
     guard perms["screenRecording"] == true else {
         fail("屏幕录制权限未授予：请在 系统设置 → 隐私与安全性 → 屏幕录制 中添加本 helper",
@@ -106,10 +107,22 @@ func screenshot() -> Never {
     guard let content = content, let display = content.displays.first else {
         fail("无法获取屏幕内容: \(String(describing: contentError))", code: "CAPTURE_FAILED")
     }
-    let filter = SCContentFilter(display: display, excludingWindows: [])
+    // Window-scoped capture: ScreenCaptureKit reads the window's own content
+    // even when it is occluded by other windows (the Codex-style background
+    // observation). Fall back to the whole display.
+    let filter: SCContentFilter
+    var capWidth = display.width
+    var capHeight = display.height
+    if let windowId = windowId, let window = content.windows.first(where: { $0.windowID == windowId }) {
+        filter = SCContentFilter(desktopIndependentWindow: window)
+        capWidth = Int(window.frame.width)
+        capHeight = Int(window.frame.height)
+    } else {
+        filter = SCContentFilter(display: display, excludingWindows: [])
+    }
     let config = SCStreamConfiguration()
-    config.width = display.width
-    config.height = display.height
+    config.width = capWidth
+    config.height = capHeight
     config.showsCursor = false
     let capturer = ScreenCapturer()
     let stream = SCStream(filter: filter, configuration: config, delegate: nil)
@@ -126,6 +139,12 @@ func screenshot() -> Never {
     guard let image = capturer.image else {
         fail(capturer.errorMessage ?? "截图失败", code: "CAPTURE_FAILED")
     }
+    let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+    return (image, scale)
+}
+
+func screenshot() -> Never {
+    let (image, scale) = captureContent()
     let dir = NSTemporaryDirectory()
     let path = dir + "dsh-computer-use-\(Int(Date().timeIntervalSince1970 * 1000)).png"
     guard let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL,
@@ -136,15 +155,47 @@ func screenshot() -> Never {
     guard CGImageDestinationFinalize(dest) else {
         fail("PNG 写入失败", code: "CAPTURE_FAILED")
     }
-    let scale = NSScreen.main?.backingScaleFactor ?? 2.0
     ok(["path": path,
         "width": image.width,
         "height": image.height,
         "scaleFactor": scale,
         "mimeType": "image/png",
         "screenBounds": ["x": 0, "y": 0,
-                         "width": Double(display.width) / scale,
-                         "height": Double(display.height) / scale]])
+                         "width": Double(NSScreen.main?.frame.width ?? 0),
+                         "height": Double(NSScreen.main?.frame.height ?? 0)]])
+}
+
+func ocr(_ args: [String: Any]) -> Never {
+    // Vision OCR over the screen (or one window when `windowId` is given):
+    // returns recognized text with pixel boxes (top-left origin, physical
+    // pixels) — a visual fallback for apps that expose no Accessibility
+    // tree (e.g. Electron), including occluded windows.
+    let windowId = (args["windowId"] as? NSNumber)?.uint32Value
+    let (image, scale) = captureContent(windowId: windowId)
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = false
+    request.recognitionLanguages = ["zh-Hans", "en-US"]
+    let handler = VNImageRequestHandler(cgImage: image)
+    do {
+        try handler.perform([request])
+    } catch {
+        fail("OCR 失败: \(error)", code: "OCR_FAILED")
+    }
+    let w = CGFloat(image.width)
+    let h = CGFloat(image.height)
+    let items: [[String: Any]] = (request.results ?? []).compactMap { observation in
+        guard let top = observation.topCandidates(1).first else { return nil }
+        let bb = observation.boundingBox // normalized, bottom-left origin
+        let box: [String: Any] = [
+            "x": bb.minX * w,
+            "y": (1 - bb.maxY) * h,
+            "width": bb.width * w,
+            "height": bb.height * h,
+        ]
+        return ["text": top.string, "box": box]
+    }
+    ok(["items": items, "scaleFactor": scale, "width": image.width, "height": image.height])
 }
 
 // MARK: - Window list
@@ -599,6 +650,8 @@ case "requestpermissions":
     requestPermissions()
 case "screenshot":
     screenshot()
+case "ocr":
+    ocr(parsed)
 case "listWindows":
     listWindows()
 case "axstate":
