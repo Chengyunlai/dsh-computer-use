@@ -1,13 +1,19 @@
 /**
  * DesktopDriver — macOS desktop Computer Use driver, backed by the native
- * Swift helper (native/macos-helper). Gives the model REAL control of the
- * system: full-screen screenshots, real mouse/keyboard events (CGEvent),
- * app/window state via the Accessibility API, and app launching.
+ * Swift helper (native/macos-helper).
  *
- * Coordinate space: screenshots are physical pixels (Retina 2x on this
- * MacBook); CGEvent/AX coordinates are logical points. The driver converts
- * model-side screenshot pixels -> logical points using the scale factor of
- * the most recent screenshot, so the model can click exactly what it sees.
+ * Two input modes:
+ *  - background (default): operates apps WITHOUT moving the user's real
+ *    mouse or stealing keyboard focus. Reading uses the Accessibility API on
+ *    the target pid; clicks use AX press actions on located elements (the
+ *    helper's CGEventPostToPid also avoids the HID layer); the launched app
+ *    is brought up briefly, then focus is returned to the user's app.
+ *  - global: classic CGEvent injection — the real pointer moves and events go
+ *    to whatever is frontmost.
+ *
+ * Coordinate space: screenshots are physical pixels (Retina 2x); AX boxes are
+ * logical points. The driver converts model-side screenshot pixels to
+ * logical points using the scale factor of the most recent screenshot.
  */
 import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
@@ -20,7 +26,6 @@ function runHelper(helperPath, command, args, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
     execFile(helperPath, [command, JSON.stringify(args ?? {})], { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout) => {
       if (error) {
-        // helper printed a JSON error on stdout before exiting nonzero in most cases
         let parsed
         try { parsed = JSON.parse(stdout) } catch { /* fall through */ }
         const message = parsed?.error ?? String(error?.message ?? error)
@@ -40,11 +45,15 @@ function runHelper(helperPath, command, args, timeoutMs = 20000) {
 export class DesktopDriver {
   constructor(options = {}) {
     this.helperPath = options.helperPath ?? DEFAULT_HELPER
+    this.inputMode = options.inputMode ?? 'background'
     this.logger = options.logger
-    this.scale = 2 // refreshed on every screenshot; Retina default
+    this.scale = 2
     this.screenW = 0
     this.screenH = 0
     this.permissionsChecked = false
+    this.targetPid = null
+    this.targetName = null
+    this.lastElements = []
   }
 
   async #run(command, args) {
@@ -89,12 +98,14 @@ export class DesktopDriver {
   async getState() {
     await this.ensure()
     const windows = await this.#run('listWindows')
+    const pid = this.targetPid ?? (await this.#run('axstate')).app?.pid
     let ax = { app: null, window: null, elements: [] }
-    try {
-      ax = await this.#run('axstate')
-    } catch (error) {
-      if (error.code === 'ACCESSIBILITY_REQUIRED') throw error
-      // frontmost app may expose no AX window; keep window list only
+    if (pid) {
+      try {
+        ax = await this.#run('axstate', { pid })
+      } catch (error) {
+        if (error.code === 'ACCESSIBILITY_REQUIRED') throw error
+      }
     }
     const scale = this.scale
     const elements = (ax.elements ?? []).map((el) => {
@@ -102,6 +113,7 @@ export class DesktopDriver {
       return {
         role: el.role,
         text: el.label ?? '',
+        index: el.index,
         box: {
           x: Math.round((b.x ?? 0) * scale),
           y: Math.round((b.y ?? 0) * scale),
@@ -110,6 +122,7 @@ export class DesktopDriver {
         },
       }
     }).filter((el) => el.box.width > 0 && el.box.height > 0)
+    this.lastElements = elements
     const window = ax.window ? {
       title: ax.window.title ?? '',
       box: {
@@ -120,7 +133,7 @@ export class DesktopDriver {
       },
     } : null
     return {
-      app: ax.app,
+      app: ax.app ?? { name: this.targetName, pid: this.targetPid },
       window,
       elements,
       windows: (windows.windows ?? []).map((w) => ({
@@ -133,7 +146,7 @@ export class DesktopDriver {
     }
   }
 
-  /** Open a URL in the default browser, or launch an application by name/bundleId. */
+  /** Open a URL in the default browser, or launch an app by name/bundleId. */
   async open(target, signal) {
     await this.ensure()
     signal?.throwIfAborted()
@@ -143,47 +156,109 @@ export class DesktopDriver {
       })
       return this.describe()
     }
+    // Remember what the user had frontmost so background mode can hand focus back.
+    const frontmost = await this.#run('axstate').catch(() => null)
     const launched = await this.#run('openapp', { query: target })
-    await new Promise((resolve) => setTimeout(resolve, 900))
-    return { app: launched.name ?? target, pid: launched.pid ?? null, ready: true }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    if (this.inputMode === 'background' && frontmost?.app?.pid && frontmost.app.pid !== launched.pid) {
+      // Hand focus back: the launched app keeps running, but the user's app
+      // stays frontmost. The launched app is operated in the background via AX.
+      await this.#run('activate', { pid: frontmost.app.pid })
+    }
+    this.targetPid = launched.pid ?? null
+    this.targetName = launched.name ?? target
+    return { app: this.targetName, pid: this.targetPid, ready: true }
   }
 
   async describe() {
-    const front = await this.#run('axstate').catch(() => null)
-    return { app: front?.app?.name ?? null, ready: true }
+    if (this.targetPid) {
+      const ax = await this.#run('axstate', { pid: this.targetPid }).catch(() => null)
+      return { app: ax?.app?.name ?? this.targetName, ready: true }
+    }
+    return { app: null, ready: true }
   }
 
   async click(x, y, { button = 'left', clickCount = 1, holdMs } = {}) {
     await this.ensure()
+    if (this.inputMode === 'background') {
+      // Prefer an AX press on the element nearest to the requested point:
+      // works while the app is in the background, without moving the pointer.
+      const target = this.#nearestElement(x, y)
+      if (target && this.targetPid) {
+        for (let i = 0; i < clickCount; i++) {
+          await this.#run('axpress', { pid: this.targetPid, label: target.text })
+          if (i < clickCount - 1) await new Promise((r) => setTimeout(r, 150))
+        }
+        return { ok: true, x, y, via: 'axpress', element: target.text, button, clickCount }
+      }
+      throw Object.assign(
+        new Error('background 模式点击需要先 get_state 定位元素（AX press 不依赖坐标）。若必须按坐标点击，请配置 inputMode: global。'),
+        { code: 'AX_TARGET_REQUIRED' },
+      )
+    }
     const sx = Math.round(x / this.scale)
     const sy = Math.round(y / this.scale)
     for (let i = 0; i < clickCount; i++) {
       await this.#run('click', { x: sx, y: sy, button })
       if (i < clickCount - 1) await new Promise((r) => setTimeout(r, 120))
     }
-    return { ok: true, x, y, button, clickCount }
+    return { ok: true, x, y, via: 'cgevent', button, clickCount }
   }
 
-  async activate(pid) {
-    await this.ensure()
-    await this.#run('activate', { pid })
-    return { ok: true }
+  #nearestElement(x, y) {
+    let best = null
+    let bestDist = 120 * this.scale // elements farther than this radius are ignored
+    for (const el of this.lastElements) {
+      const cx = el.box.x + el.box.width / 2
+      const cy = el.box.y + el.box.height / 2
+      const dist = Math.hypot(x - cx, y - cy)
+      if (dist < bestDist) {
+        bestDist = dist
+        best = el
+      }
+    }
+    return best
   }
 
   async type(text) {
     await this.ensure()
+    if (this.inputMode === 'background') {
+      // Text input to a background app is not reliable via events; use AX
+      // value setting on the focused text element when available.
+      const state = await this.getState()
+      const focused = state.elements.find((el) => el.role === 'AXTextField' || el.role === 'AXTextArea' || el.role === 'AXSearchField')
+      if (focused && this.targetPid) {
+        await this.#run('axsetvalue', { pid: this.targetPid, label: focused.text, value: text }).catch(() => {
+          throw Object.assign(new Error('后台模式文本输入需要目标文本框（AX setValue）；坐标键入请配置 inputMode: global'), { code: 'AX_SETVALUE_FAILED' })
+        })
+        return { ok: true, via: 'axsetvalue', length: text.length }
+      }
+      throw Object.assign(new Error('后台模式未找到可输入文本框；键入类操作请配置 inputMode: global'), { code: 'AX_TARGET_REQUIRED' })
+    }
     await this.#run('type', { text })
-    return { ok: true, length: text.length }
+    return { ok: true, via: 'cgevent', length: text.length }
   }
 
   async keypress(key) {
     await this.ensure()
+    if (this.inputMode === 'background') {
+      throw Object.assign(
+        new Error('后台模式不支持按键组合（键盘事件需要目标在前台）；请配置 inputMode: global 或让目标应用前台'),
+        { code: 'AX_KEYPRESS_UNSUPPORTED' },
+      )
+    }
     await this.#run('keypress', { key })
-    return { ok: true, key }
+    return { ok: true, via: 'cgevent', key }
   }
 
   async scroll(x, y, deltaX, deltaY) {
     await this.ensure()
+    if (this.inputMode === 'background') {
+      throw Object.assign(
+        new Error('后台模式不支持滚轮（需要目标在前台）；请配置 inputMode: global'),
+        { code: 'AX_SCROLL_UNSUPPORTED' },
+      )
+    }
     await this.#run('scroll', { x: Math.round(x / this.scale), y: Math.round(y / this.scale), deltaX, deltaY })
     return { ok: true, x, y, deltaX, deltaY }
   }
@@ -191,6 +266,19 @@ export class DesktopDriver {
   async wait(ms) {
     await new Promise((resolve) => setTimeout(resolve, ms))
     return { ok: true, waitedMs: ms }
+  }
+
+  /** Raise the target app's window above other windows WITHOUT activating it
+   *  (used by GIF demos so a background-operated window stays visible). */
+  async raise() {
+    if (this.targetPid) await this.#run('axraise', { pid: this.targetPid })
+    return { ok: true }
+  }
+
+  async activate(pid) {
+    await this.ensure()
+    await this.#run('activate', { pid })
+    return { ok: true }
   }
 
   async close() {

@@ -20,7 +20,7 @@ GIFs of three real-world scenarios, all recorded by the plugin's own driver (the
 
 ## macOS desktop driver (real mouse · system understanding)
 
-Besides the browser, `computer_use` can drive the macOS desktop in **desktop** mode: full-screen captures, **real mouse/keyboard events** (CGEvent), app/window/element state via the Accessibility API, and launching/activating apps. Demo (operating the real Calculator, `7 + 3 =`):
+Besides the browser, `computer_use` can drive the macOS desktop in **desktop** mode: full-screen captures, app/window/element state via the Accessibility API, and launching/activating apps. **Background mode by default**: the target app is operated through AX actions — your real mouse never moves and keyboard focus is not stolen (switch with `inputMode: global` to real CGEvent input). Demo (operating the Calculator in the background, `7 + 3 =`, real mouse untouched):
 
 ![desktop demo](docs/demos/desktop-calculator.gif)
 
@@ -49,6 +49,7 @@ To add the helper path: click **"+"** in the list, press `Cmd+Shift+G` in the fi
     driver: desktop          # or browser (default)
     desktop:
       helperPath: null       # defaults to native/macos-helper in the repo
+      inputMode: background  # background (default; no real mouse movement, no focus steal) | global (real CGEvent mouse)
 ```
 
 In desktop mode the `computer_use` actions are:
@@ -166,7 +167,7 @@ Honest status, verified on 2026-10-30 against DeepSeek Harness 0.2.1-rc.3:
 - **Standalone e2e** (`test/driver.e2e.mjs`): open / screenshot (1280×800 PNG) / get_state (lossless JSON) / click-to-expand / type / click-to-save / status flip + input value readback / keypress / scroll — **all pass** on the local demo page (`test-page.html`).
 - **In-harness loop**: the lead agent actually called `computer_use` end to end — opened the demo page, screenshot, `get_state` → element boxes, clicked *查看任务详情*, typed `hello computer use`, clicked *保存备注*, and verified via a second `get_state` that the status flipped to *任务状态：已经完成* and the input kept the typed text.
 - **Real-world operation**: the same tool drove figma.com (open, click *Allow all cookies* to dismiss the banner, scroll) plus multi-step Wikipedia / GitHub runs — the GIFs above are those recordings.
-- **Desktop driver e2e** (`test/driver.desktop.e2e.mjs`): launch Calculator → locate the `7 / + / 3 / =` buttons via AX → real mouse clicks → Calculator shows `10` — **passed** (on a Chinese-system macOS, operator labels are 加/等于; AX understanding works).
+- **Desktop driver e2e (background mode)** (`test/driver.desktop.e2e.mjs`): launch Calculator and hand focus back → read buttons via background AX → **AX press clicks** on `7 / + / 3 / =` → Calculator shows `10` — **all passed**; **focus is never stolen** (the user's frontmost app stays frontmost) and the **real mouse never moves** (verified before/after every click).
 - **Known limitation**: with a text-only model route (e.g. `deepseek-v4-flash` without image input declared), screenshots fall back to file paths; switch to an image-capable model to receive inline image content blocks. Desktop captures additionally require the Screen Recording permission.
 
 ## Roadmap

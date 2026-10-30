@@ -19,7 +19,7 @@
 
 ## macOS 桌面驱动（真实鼠标 · 系统理解）
 
-除了浏览器，`computer_use` 还能以 **desktop** 模式驱动 macOS 桌面：整屏截图、**真实鼠标/键盘事件**（CGEvent）、通过辅助功能 API 读取**应用/窗口/元素状态**、启动并激活应用。演示（真实操作计算器，`7 + 3 =`）：
+除了浏览器，`computer_use` 还能以 **desktop** 模式驱动 macOS 桌面：整屏截图、通过辅助功能 API 读取**应用/窗口/元素状态**、启动并激活应用。**默认后台模式**：用 AX 动作操作目标应用，**不移动你的真实鼠标、不抢键盘焦点**（可选 `inputMode: global` 切换为真实 CGEvent 鼠标）。演示（后台操作计算器，`7 + 3 =`，全程真实鼠标不动）：
 
 ![桌面演示](docs/demos/desktop-calculator.gif)
 
@@ -48,6 +48,7 @@ helper 需要两项系统权限，在 **系统设置 → 隐私与安全性** �
     driver: desktop          # 或 browser（默认）
     desktop:
       helperPath: null       # 默认用仓库内 native/macos-helper
+      inputMode: background  # background（默认，不移动真实鼠标/不抢焦点）| global（真实 CGEvent 鼠标）
 ```
 
 desktop 模式下 `computer_use` 的动作：
@@ -164,7 +165,7 @@ computer-use/
 - **独立 e2e**（`test/driver.e2e.mjs`）：open / screenshot（1280×800 PNG）/ get_state（无损 JSON）/ 点击展开 / 输入 / 点击保存 / 状态翻转 + 输入值回读 / keypress / scroll —— 在本地演示页（`test-page.html`）上**全部通过**。
 - **Harness 内闭环**：lead agent 实际调用 `computer_use` 全流程——打开演示页、截图、`get_state` 拿元素框坐标、点击"查看任务详情"、输入 `hello computer use`、点击"保存备注"，再用第二次 `get_state` 确认状态翻转为"任务状态：已经完成"且输入框保留文本。
 - **真实站点操作**：同一套工具驱动了 figma.com（打开、点击 *Allow all cookies* 关横幅、滚动）与 Wikipedia / GitHub 的多步操作，上方 GIF 即来自这些录制。
-- **桌面驱动 e2e**（`test/driver.desktop.e2e.mjs`）：启动计算器 → AX 定位 `7 / 加 / 3 / 等于` 按钮 → 真实鼠标点击 → 计算器显示 `10` —— **通过**（中文系统，运算符 label 为"加/等于"，AX 理解正常）。
+- **桌面驱动 e2e（后台模式）**（`test/driver.desktop.e2e.mjs`）：启动计算器并归还焦点 → 后台 AX 读取按钮 → **AX press 点击** `7 / 加 / 3 / 等于` → 计算器显示 `10` —— **全部通过**；全程**焦点不被抢**（用户前台应用不变）、**真实鼠标不动**（逐次点击前后对比）。
 - **已知限制**：文本模型路由（如未声明 image 输入的 `deepseek-v4-flash`）下截图回退为文件路径；换成图像模型即可收到内联图像内容块。桌面截图需要屏幕录制权限。
 
 ## Roadmap

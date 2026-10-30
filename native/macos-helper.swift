@@ -114,7 +114,9 @@ func screenshot() -> Never {
     let capturer = ScreenCapturer()
     let stream = SCStream(filter: filter, configuration: config, delegate: nil)
     do {
-        try stream.addStreamOutput(capturer, type: .screen, sampleHandlerQueue: .main)
+        // NOT .main: the CLI main thread blocks on the semaphore below, so a
+        // main-queue handler would never run. Use a dedicated queue.
+        try stream.addStreamOutput(capturer, type: .screen, sampleHandlerQueue: DispatchQueue(label: "dsh-capture"))
         try stream.startCapture()
     } catch {
         fail("开始截屏失败: \(error)", code: "CAPTURE_FAILED")
@@ -179,16 +181,28 @@ func requireAX() {
     }
 }
 
-func post(_ event: CGEvent) {
-    event.post(tap: .cghidEventTap)
+func post(_ event: CGEvent, to pid: pid_t? = nil) {
+    if let pid = pid {
+        // Background (virtual) input: deliver the event directly to the target
+        // process without going through the HID layer, so the user's real
+        // mouse pointer never moves.
+        event.postToPid(pid)
+    } else {
+        event.post(tap: .cghidEventTap)
+    }
     usleep(30_000)
 }
 
-func moveMouse(_ x: Double, _ y: Double) {
+func moveMouse(_ x: Double, _ y: Double, to pid: pid_t? = nil) {
     let point = CGPoint(x: x, y: y)
     if let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
-        post(move)
+        post(move, to: pid)
     }
+}
+
+func targetPid(_ args: [String: Any]) -> pid_t? {
+    // Background mode: events go to this pid without moving the real pointer.
+    (args["pid"] as? NSNumber)?.int32Value
 }
 
 func click(_ args: [String: Any]) -> Never {
@@ -199,14 +213,17 @@ func click(_ args: [String: Any]) -> Never {
     if let v = double(args, "y") { y = v } else { fail("click 需要 y") }
     let buttonName = (args["button"] as? String) ?? "left"
     let button: CGMouseButton = buttonName == "right" ? .right : (buttonName == "middle" ? .center : .left)
+    let pid = targetPid(args)
     let point = CGPoint(x: x, y: y)
-    moveMouse(x, y)
-    usleep(60_000)
+    if pid == nil {
+        moveMouse(x, y)
+        usleep(60_000)
+    }
     if let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: button) {
-        post(down)
+        post(down, to: pid)
     }
     if let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: button) {
-        post(up)
+        post(up, to: pid)
     }
     ok()
 }
@@ -214,14 +231,15 @@ func click(_ args: [String: Any]) -> Never {
 func typeText(_ args: [String: Any]) -> Never {
     requireAX()
     guard let text = args["text"] as? String else { fail("type 需要 text") }
+    let pid = targetPid(args)
     for scalar in text.unicodeScalars {
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true) else { continue }
         var code = UInt16(scalar.value)
         down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &code)
-        post(down)
+        post(down, to: pid)
         guard let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { continue }
         up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &code)
-        post(up)
+        post(up, to: pid)
         usleep(20_000)
     }
     ok()
@@ -272,14 +290,15 @@ func pressKey(_ args: [String: Any]) -> Never {
     }
     let code: CGKeyCode
     if let v = KEYCODES[keyName] { code = v } else { fail("不支持的按键: \(chord)") }
+    let pid = targetPid(args)
     if let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true) {
         down.flags = flags
-        post(down)
+        post(down, to: pid)
     }
     usleep(40_000)
     if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
         up.flags = flags
-        post(up)
+        post(up, to: pid)
     }
     ok()
 }
@@ -290,12 +309,23 @@ func scroll(_ args: [String: Any]) -> Never {
     let y = double(args, "y") ?? 0
     let dx = double(args, "deltaX") ?? 0
     let dy = double(args, "deltaY") ?? 0
-    moveMouse(x, y)
+    let pid = targetPid(args)
+    if pid == nil { moveMouse(x, y) }
     if let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
                            wheel1: Int32(-dy), wheel2: Int32(-dx), wheel3: 0) {
-        post(event)
+        post(event, to: pid)
     }
     ok()
+}
+
+func mousePosition() -> Never {
+    // Current real pointer location, for verifying background input never
+    // moves the user's mouse.
+    if let event = CGEvent(source: nil) {
+        let p = event.location
+        ok(["x": p.x, "y": p.y])
+    }
+    fail("无法读取鼠标位置", code: "MOUSE_POSITION_FAILED")
 }
 
 // MARK: - AX state
@@ -343,6 +373,7 @@ func axChildren(_ element: AXUIElement) -> [AXUIElement] {
 
 struct AXWalker {
     var collected: [[String: Any]] = []
+    var refs: [AXUIElement] = []
     var budget: Int
     var depthLeft: Int
 
@@ -360,7 +391,8 @@ struct AXWalker {
                let s = axSize(element, kAXSizeAttribute as CFString) {
                 box = ["x": p.x, "y": p.y, "width": s.width, "height": s.height]
             }
-            collected.append(["role": role, "label": label, "box": box])
+            collected.append(["role": role, "label": label, "box": box, "index": refs.count])
+            refs.append(element)
             budget -= 1
         }
         for child in axChildren(element) {
@@ -370,30 +402,116 @@ struct AXWalker {
     }
 }
 
-func axState() -> Never {
-    requireAX()
-    guard let front = NSWorkspace.shared.frontmostApplication else {
-        fail("无法获取前台应用", code: "AX_FAILED")
-    }
-    let pid = front.processIdentifier
+func axTree(pid: pid_t) -> (app: [String: Any], window: [String: Any]?, elements: [[String: Any]], refs: [AXUIElement]) {
+    let app = NSRunningApplication(processIdentifier: pid)
     let appElement = AXUIElementCreateApplication(pid)
     var windowRef: CFTypeRef?
     let err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowRef)
     guard err == .success, let windowList = windowRef as? [AXUIElement], !windowList.isEmpty else {
-        ok(["app": ["name": front.localizedName ?? "", "pid": pid], "window": nil, "elements": []])
+        return (["name": app?.localizedName ?? "", "pid": pid], nil, [], [])
     }
     let mainWindow = windowList[0]
     var walker = AXWalker(budget: 200, depthLeft: 8)
     walker.walk(mainWindow)
-    let windowTitle = axString(mainWindow, kAXTitleAttribute as CFString) ?? ""
     var wBox: [String: Any] = [:]
     if let p = axPoint(mainWindow, kAXPositionAttribute as CFString),
        let s = axSize(mainWindow, kAXSizeAttribute as CFString) {
         wBox = ["x": p.x, "y": p.y, "width": s.width, "height": s.height]
     }
-    ok(["app": ["name": front.localizedName ?? "", "pid": pid],
-        "window": ["title": windowTitle, "box": wBox],
-        "elements": walker.collected])
+    let window: [String: Any] = [
+        "title": axString(mainWindow, kAXTitleAttribute as CFString) ?? "",
+        "box": wBox,
+    ]
+    return (["name": app?.localizedName ?? "", "pid": pid], window, walker.collected, walker.refs)
+}
+
+func axState(_ args: [String: Any]) -> Never {
+    requireAX()
+    let pid = targetPid(args) ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+    guard let pid = pid else { fail("无法解析目标应用", code: "AX_FAILED") }
+    let (app, window, elements, _) = axTree(pid: pid)
+    ok(["app": app, "window": window, "elements": elements])
+}
+
+func axPress(_ args: [String: Any]) -> Never {
+    requireAX()
+    let pid = targetPid(args)
+    guard let pid = pid else { fail("axpress 需要 pid") }
+    let (_, _, _, refs) = axTree(pid: pid)
+
+    func strip(_ s: String) -> String {
+        s.replacingOccurrences(of: "\u{200e}", with: "")
+          .replacingOccurrences(of: "\u{200f}", with: "")
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Prefer label matching (order-independent; AX trees can reorder as the
+    // UI state changes). Falls back to an explicit index.
+    if let label = args["label"] as? String {
+        let want = strip(label)
+        for (i, ref) in refs.enumerated() {
+            let l = strip((axString(ref, kAXTitleAttribute as CFString) ?? "")
+                + (axString(ref, kAXValueAttribute as CFString) ?? "")
+                + (axString(ref, kAXDescriptionAttribute as CFString) ?? ""))
+            if l == want {
+                let error = AXUIElementPerformAction(ref, kAXPressAction as CFString)
+                if error != .success { fail("AX press 失败: \(error.rawValue)", code: "AX_PRESS_FAILED") }
+                ok(["index": i, "label": label])
+            }
+        }
+        fail("未找到元素: \(label)", code: "AX_LABEL_NOT_FOUND")
+    }
+
+    let index = (args["index"] as? NSNumber)?.intValue
+    guard let index = index else { fail("axpress 需要 index 或 label") }
+    guard index >= 0, index < refs.count else { fail("元素索引越界: \(index)", code: "AX_INDEX_OUT_OF_RANGE") }
+    let element = refs[index]
+    let error = AXUIElementPerformAction(element, kAXPressAction as CFString)
+    if error != .success {
+        fail("AX press 失败: \(error.rawValue)", code: "AX_PRESS_FAILED")
+    }
+    ok(["index": index])
+}
+
+func axSetValue(_ args: [String: Any]) -> Never {
+    requireAX()
+    let pid = targetPid(args)
+    let label = args["label"] as? String
+    let value = args["value"] as? String
+    guard let pid = pid, let label = label, let value = value else { fail("axsetvalue 需要 pid/label/value") }
+    let (_, _, _, refs) = axTree(pid: pid)
+    for ref in refs {
+        let l = (axString(ref, kAXTitleAttribute as CFString) ?? "")
+            + (axString(ref, kAXValueAttribute as CFString) ?? "")
+            + (axString(ref, kAXDescriptionAttribute as CFString) ?? "")
+        if l == label {
+            let error = AXUIElementSetAttributeValue(ref, kAXValueAttribute as CFString, value as CFTypeRef)
+            if error != .success { fail("AX setValue 失败: \(error.rawValue)", code: "AX_SETVALUE_FAILED") }
+            ok(["label": label])
+        }
+    }
+    fail("未找到文本框: \(label)", code: "AX_LABEL_NOT_FOUND")
+}
+
+func axRaise(_ args: [String: Any]) -> Never {
+    requireAX()
+    let pid = targetPid(args)
+    guard let pid = pid else { fail("axraise 需要 pid") }
+    let appElement = AXUIElementCreateApplication(pid)
+    var windowRef: CFTypeRef?
+    let err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowRef)
+    guard err == .success, let windowList = windowRef as? [AXUIElement], !windowList.isEmpty else {
+        fail("目标应用没有窗口", code: "AX_NO_WINDOW")
+    }
+    // Raise the first window to the front WITHOUT activating the app:
+    // the window becomes visible for screenshots/GIFs while focus stays with
+    // the user's current application.
+    let window = windowList[0]
+    let actionError = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    if actionError != .success {
+        fail("AX raise 失败: \(actionError.rawValue)", code: "AX_RAISE_FAILED")
+    }
+    ok()
 }
 
 // MARK: - App launch
@@ -484,7 +602,13 @@ case "screenshot":
 case "listWindows":
     listWindows()
 case "axstate":
-    axState()
+    axState(parsed)
+case "axpress":
+    axPress(parsed)
+case "axraise":
+    axRaise(parsed)
+case "axsetvalue":
+    axSetValue(parsed)
 case "click":
     click(parsed)
 case "type":
@@ -493,6 +617,8 @@ case "keypress":
     pressKey(parsed)
 case "scroll":
     scroll(parsed)
+case "mousepos":
+    mousePosition()
 case "openapp":
     openApp(parsed)
 case "activate":
