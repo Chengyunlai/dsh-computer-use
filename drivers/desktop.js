@@ -2,14 +2,11 @@
  * DesktopDriver — macOS desktop Computer Use driver, backed by the native
  * Swift helper (native/macos-helper).
  *
- * Two input modes:
- *  - background (default): operates apps WITHOUT moving the user's real
- *    mouse or stealing keyboard focus. Reading uses the Accessibility API on
- *    the target pid; clicks use AX press actions on located elements (the
- *    helper's CGEventPostToPid also avoids the HID layer); the launched app
- *    is brought up briefly, then focus is returned to the user's app.
- *  - global: classic CGEvent injection — the real pointer moves and events go
- *    to whatever is frontmost.
+ * Background input uses AX presses on supported controls or the exact window
+ * from the last screenshot. Window-routed dispatch never uses global input;
+ * callers must observe the application to verify its effect. Application
+ * selection requests a background launch without restoring another app.
+ * Global input uses the real pointer and foreground keyboard recipient.
  *
  * Coordinate space: screenshots are physical pixels (Retina 2x); AX boxes are
  * logical points. The driver converts model-side screenshot pixels to
@@ -133,6 +130,7 @@ export class DesktopDriver {
     this.targetPid = null
     this.targetName = null
     this.lastElements = []
+    this.capture = null
   }
 
   async #run(command, args, timeoutMs) {
@@ -177,6 +175,9 @@ export class DesktopDriver {
         { code: 'DESKTOP_PERMISSION_REQUIRED' },
       )
     }
+    if (this.inputMode === 'background' && perms.backgroundProtocol !== 2) {
+      throw Object.assign(new Error('原生 helper 版本不匹配，请在插件目录运行 bash native/build.sh 后重试'), { code: 'HELPER_REBUILD_REQUIRED' })
+    }
     this.permissionsChecked = true
   }
 
@@ -191,6 +192,7 @@ export class DesktopDriver {
       await unlink(shot.path)
       await rmdir(dirname(shot.path))
     }
+    this.capture = { pid: this.targetPid, windowId: shot.windowId, bounds: shot.screenBounds }
     this.origin = shot.origin
     this.scale = shot.scaleFactor ?? this.scale
     this.screenW = shot.screenBounds?.width ?? 0
@@ -269,15 +271,9 @@ export class DesktopDriver {
       })
       return this.describe()
     }
-    // Remember what the user had frontmost so background mode can hand focus back.
-    const frontmost = await this.#run('axstate').catch(() => null)
-    const launched = await this.#run('openapp', { query: target })
-    await new Promise((resolve) => setTimeout(resolve, 1000))
-    if (this.inputMode === 'background' && frontmost?.app?.pid && frontmost.app.pid !== launched.pid) {
-      // Hand focus back: the launched app keeps running, but the user's app
-      // stays frontmost. The launched app is operated in the background via AX.
-      await this.#run('activate', { pid: frontmost.app.pid })
-    }
+    const launched = await this.#run('openapp', { query: target, background: this.inputMode === 'background' })
+    this.capture = null
+    this.lastElements = []
     this.targetPid = launched.pid ?? null
     this.targetName = launched.name ?? target
     return { app: this.targetName, pid: this.targetPid, ready: true }
@@ -294,30 +290,24 @@ export class DesktopDriver {
   async click(x, y, { button = 'left', clickCount = 1, holdMs } = {}) {
     await this.ensure()
     if (this.inputMode === 'background') {
-      // Prefer an AX press on the element nearest to the requested point:
-      // works while the app is in the background, without moving the pointer.
-      const target = this.#nearestElement(x, y)
-      if (target && this.targetPid) {
-        if (target.source === 'ocr') {
-          // OCR-recognized text has no AX press target; click by coordinates
-          // via postToPid (virtual, does not move the real pointer). Targeted
-          // events reach Electron apps only while they are frontmost.
-          const sx = Math.round(x / this.scale + this.origin.x)
-          const sy = Math.round(y / this.scale + this.origin.y)
-          await this.#run('click', { x: sx, y: sy, pid: this.targetPid })
-          return { ok: true, x, y, via: 'postToPid', element: target.text, button, clickCount }
-        }
-        for (let i = 0; i < clickCount; i++) {
-          await this.#run('axpress', { pid: this.targetPid, label: target.text })
-          if (i < clickCount - 1) await new Promise((r) => setTimeout(r, 150))
-        }
-        return { ok: true, x, y, via: 'axpress', element: target.text, button, clickCount }
+      if (holdMs !== undefined || button !== 'left' || ![1, 2].includes(clickCount)) {
+        throw Object.assign(new Error('后台点击仅支持左键单击或双击，不支持长按'), { code: 'BACKGROUND_UNSUPPORTED' })
       }
-      throw Object.assign(
-        new Error('background 模式点击需要先 get_state 定位元素（AX press 不依赖坐标）。若必须按坐标点击，请配置 inputMode: global。'),
-        { code: 'AX_TARGET_REQUIRED' },
-      )
+      const target = this.#nearestElement(x, y)
+      if (target && target.source !== 'ocr' && this.targetPid) {
+        for (let i = 0; i < clickCount; i++) await this.#run('axpress', { pid: this.targetPid, label: target.text })
+        return { ok: true, dispatched: true, verified: false, x, y, via: 'axpress', element: target.text }
+      }
+      if (!this.capture?.windowId || this.capture.pid !== this.targetPid) {
+        throw Object.assign(new Error('后台坐标点击需要先截取目标窗口'), { code: 'WINDOW_CAPTURE_REQUIRED' })
+      }
+      const result = await this.#run('click', {
+        pid: this.targetPid, windowId: this.capture.windowId, bounds: this.capture.bounds,
+        x: x / this.scale + this.origin.x, y: y / this.scale + this.origin.y, button, clickCount,
+      })
+      return { ...result, x, y }
     }
+
     const sx = Math.round(x / this.scale + this.origin.x)
     const sy = Math.round(y / this.scale + this.origin.y)
     for (let i = 0; i < clickCount; i++) {
@@ -327,10 +317,19 @@ export class DesktopDriver {
     return { ok: true, x, y, via: 'cgevent', button, clickCount }
   }
 
+  #backgroundWindow() {
+    if (!this.capture?.windowId || this.capture.pid !== this.targetPid) {
+      throw Object.assign(new Error('后台键盘输入需要先截取目标窗口，再点击输入框并观察'), { code: 'WINDOW_CAPTURE_REQUIRED' })
+    }
+    return { pid: this.targetPid, windowId: this.capture.windowId, bounds: this.capture.bounds }
+  }
+
   #nearestElement(x, y) {
     let best = null
     let bestDist = 120 * this.scale // elements farther than this radius are ignored
     for (const el of this.lastElements) {
+      if (!el.text || !['AXButton', 'AXCheckBox', 'AXRadioButton', 'AXLink', 'AXMenuItem'].includes(el.role)) continue
+      if (x < el.box.x || y < el.box.y || x >= el.box.x + el.box.width || y >= el.box.y + el.box.height) continue
       const cx = el.box.x + el.box.width / 2
       const cy = el.box.y + el.box.height / 2
       const dist = Math.hypot(x - cx, y - cy)
@@ -345,8 +344,8 @@ export class DesktopDriver {
   async type(text) {
     await this.ensure()
     if (this.inputMode === 'background') {
-      // Text input to a background app is not reliable via events; use AX
-      // value setting on the focused text element when available.
+      // Prefer AX insertion; custom views use exact-window keyboard delivery
+      // and remain unverified until the caller observes the result.
       const state = await this.getState()
       const focused = state.elements.find((el) => el.role === 'AXTextField' || el.role === 'AXTextArea' || el.role === 'AXSearchField')
       if (focused && this.targetPid) {
@@ -355,7 +354,7 @@ export class DesktopDriver {
         })
         return { ok: true, via: 'axsetvalue', length: text.length }
       }
-      throw Object.assign(new Error('后台模式未找到可输入文本框；键入类操作请配置 inputMode: global'), { code: 'AX_TARGET_REQUIRED' })
+      return this.#run('type', { ...this.#backgroundWindow(), text })
     }
     await this.#run('type', { text })
     return { ok: true, via: 'cgevent', length: text.length }
@@ -364,10 +363,7 @@ export class DesktopDriver {
   async keypress(key) {
     await this.ensure()
     if (this.inputMode === 'background') {
-      throw Object.assign(
-        new Error('后台模式不支持按键组合（键盘事件需要目标在前台）；请配置 inputMode: global 或让目标应用前台'),
-        { code: 'AX_KEYPRESS_UNSUPPORTED' },
-      )
+      return this.#run('keypress', { ...this.#backgroundWindow(), key })
     }
     await this.#run('keypress', { key })
     return { ok: true, via: 'cgevent', key }

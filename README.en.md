@@ -45,22 +45,25 @@ Requires DeepSeek Harness 0.2.1-rc.3 or later, Node.js and Google Chrome. Deskto
 - `open`: URLs select the browser, application names such as `Calculator` select desktop. Use `mode: browser` or `desktop` to pin the driver.
 - `screenshot`: browser viewport or selected application's largest ordinary window. Missing windows and denied permissions fail without capturing the full display.
 - `get_state`: page elements or target application AX elements, plus system window information. After a desktop screenshot, coordinates are relative to that window and translated to screen coordinates by the driver.
-- `click` / `type` / `keypress` / `scroll`: supported in browsers. Default desktop `background` input relies on AX controls supplied by the application; arbitrary application support is not guaranteed.
-- Desktop background mode does not support general keyboard chords or scrolling. Applications without AX controls fail explicitly. `inputMode: global` uses the foreground mouse and keyboard and affects user input.
+- `click` / `type` / `keypress` / `scroll`: supported in browsers. Default desktop `background` clicks prefer an AX control containing the point; custom surfaces use the exact window and coordinates from the latest screenshot for a single or double left click. `dispatched: true, verified: false` only records dispatch; take another screenshot to verify the result.
+- Desktop background mode supports text and key chords addressed to the observed window; scrolling remains unsupported. Text prefers AX fields and otherwise uses PID/window-directed keys. Click the input first; the helper requires the exact target window to hold the application’s focus. Coordinate clicks reject hidden/minimized windows, changed geometry and unavailable private APIs without foreground fallback. `inputMode: global` uses the foreground mouse and keyboard and affects user input.
 - `wait` waits; `close` closes browser and helper resources and awaits helper exit.
 
-Launching an app can briefly activate it before restoring the previous app's focus. Background input uses Accessibility and process-targeted events. It does not inject code, create an independent desktop, or provide a universal virtual mouse.
+Selecting a running app in background mode does not activate it. New apps use the system background-launch option; an app can still request activation itself. Background input uses Accessibility and process-targeted events. It does not inject code, create an independent desktop, or provide a universal virtual mouse.
 
 Screenshots use Harness attachments when the model route declares image support, otherwise a local path is returned. Target windows can contain private information; treat screenshots and attachments as private data.
 
 ## Validation
 
 ```sh
-node --test test/privacy.test.mjs
+node --test test/privacy.test.mjs test/background-click.test.mjs
+node test/background-pointer.e2e.mjs
 node test/driver.desktop.e2e.mjs
 ```
 
-The first command checks missing targets, vanished windows without display fallback, and helper exit/restart. The desktop scenario requires system permissions; user pointer movement can fail the stationary-pointer assertions. The browser scenario `test/driver.e2e.mjs` needs the local fixture at `http://127.0.0.1:8734/test-page.html`.
+`background-pointer.e2e.mjs` uses only an owned background fixture, checks an independent counter changes from 0 to 1, verifies stale/outside-window clicks do not increment it, and compares foreground app and pointer position. Owned windows and captures are cleaned up on exit.
+
+The first command checks screenshot scope, background selection, exact-window coordinate conversion, no replay after failure, old-helper rejection, and helper exit/restart. The desktop scenario requires system permissions; user pointer movement can fail the stationary-pointer assertions. The browser scenario `test/driver.e2e.mjs` needs the local fixture at `http://127.0.0.1:8734/test-page.html`.
 
 ## Data removal
 
@@ -69,3 +72,5 @@ Desktop screenshots and recordings are not uploaded automatically. Deleting the 
 ## License
 
 MIT © Chengyunlai. See [LICENSE](LICENSE).
+
+Background pointer sequences adapt Cua Driver `cua-driver-rs-v0.38.0` (`input/mouse.rs` and `input/skylight.rs`) under the [MIT license](native/LICENSE.cua-driver). This route uses private macOS APIs and is not guaranteed across OS versions or applications.

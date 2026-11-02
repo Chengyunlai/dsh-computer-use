@@ -171,8 +171,8 @@ export function apply(ctx, config) {
     description: [
       'Observe and operate the computer like a human user — a browser, a desktop app, the file manager, or system settings,',
       'switching freely within one task. action=open routes automatically: a URL opens in the private browser driver; an app name',
-      '(e.g. "Calculator", "Finder", "系统设置") opens in the macOS desktop driver (background AX input by default: the real mouse',
-      'and keyboard focus are untouched). Screenshot the current view, click at pixel coordinates, type, press keys, scroll, and read',
+      '(e.g. "Calculator", "Finder", "系统设置") opens in the macOS desktop driver (background AX or exact-window clicks by default: the real mouse',
+      'is not moved). Desktop background text/keys target the observed app window after clicking its input; scrolling is unsupported. Dispatch is unverified: screenshot to confirm. Screenshot, click, and read',
       'interactive state; every observation/action follows the surface opened last (get_state reports the current `surface`).',
       'Coordinate space: x/y are pixels of the most recent screenshot image, top-left origin; that image is the ground truth.',
       'Workflow: open → screenshot → act → screenshot again to verify. Prefer get_state when locating elements precisely.',

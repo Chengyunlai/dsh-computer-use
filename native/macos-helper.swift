@@ -11,6 +11,7 @@
 //   - Screen Recording (ScreenCaptureKit capture)    -> Privacy & Security > Screen Recording
 
 import Foundation
+import Darwin
 import CoreGraphics
 import ApplicationServices
 import AppKit
@@ -182,6 +183,7 @@ func screenshot(_ args: [String: Any]) -> [String: Any] {
         "scaleFactor": scale,
         "mimeType": "image/png",
         "scope": "window",
+        "windowId": number.uint32Value,
         "origin": ["x": bounds["X"] ?? 0, "y": bounds["Y"] ?? 0],
         "screenBounds": bounds])
 }
@@ -279,6 +281,122 @@ func targetPid(_ args: [String: Any]) -> pid_t? {
     (args["pid"] as? NSNumber)?.int32Value
 }
 
+
+// Adapted from Cua Driver cua-driver-rs-v0.38.0 input/{mouse,skylight}.rs.
+// Copyright (c) 2025 Cua AI, Inc. MIT; see native/LICENSE.cua-driver.
+// Private symbols are optional at load; coordinate input fails closed when absent.
+let pointerLibrary = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY | RTLD_GLOBAL)
+
+func pointerSymbol<T>(_ name: String, as type: T.Type) -> T? {
+    guard pointerLibrary != nil else { return nil }
+    guard let ptr = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }
+    return unsafeBitCast(ptr, to: type)
+}
+
+/// Validate screenshot identity, geometry and minimized/hidden state without changing focus.
+func validateBackgroundWindow(_ args: [String: Any], pid: pid_t, point: CGPoint? = nil) -> [String: Any]? {
+    guard let wid = (args["windowId"] as? NSNumber)?.uint32Value,
+          let expected = args["bounds"] as? [String: Double],
+          let row = (CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]])?.first(where: {
+              ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == wid
+          }),
+          (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+          let bounds = row[kCGWindowBounds as String] as? [String: Double], bounds == expected,
+          let bx = bounds["X"], let by = bounds["Y"], let bw = bounds["Width"], let bh = bounds["Height"], bw > 0, bh > 0 else {
+        return fail("目标窗口已改变或坐标不属于截图；请重新截图", code: "STALE_WINDOW")
+    }
+    if let point, !point.x.isFinite || !point.y.isFinite || point.x < bx || point.y < by || point.x >= bx + bw || point.y >= by + bh {
+        return fail("坐标不属于目标窗口，请重新截图", code: "STALE_WINDOW")
+    }
+    guard let app = NSRunningApplication(processIdentifier: pid), !app.isHidden else {
+        return fail("目标应用已隐藏", code: "BACKGROUND_UNAVAILABLE")
+    }
+    // Resolve the exact AX window to exclude minimized windows; unresolved state fails closed.
+    let ax = AXUIElementCreateApplication(pid)
+    var rawWindows: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(ax, kAXWindowsAttribute as CFString, &rawWindows) == .success,
+          let windows = rawWindows as? [AXUIElement] else {
+        return fail("无法确认目标窗口状态", code: "BACKGROUND_UNAVAILABLE")
+    }
+    typealias WindowNumber = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    guard let number = pointerSymbol("_AXUIElementGetWindow", as: WindowNumber.self),
+          let window = windows.first(where: { element in var id: CGWindowID = 0; return number(element, &id) == .success && id == wid }) else {
+        return fail("无法确认目标 AX 窗口", code: "BACKGROUND_UNAVAILABLE")
+    }
+    var minimized: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimized) == .success,
+          (minimized as? Bool) == false else {
+        return fail("目标窗口已最小化或状态不可用", code: "BACKGROUND_UNAVAILABLE")
+    }
+    return nil
+}
+
+/// Sends only to the screenshot's exact window. Never defocuses the user's app or posts to HID.
+func backgroundClick(_ args: [String: Any], pid: pid_t, x: Double, y: Double) -> [String: Any] {
+    if let error = validateBackgroundWindow(args, pid: pid, point: CGPoint(x: x, y: y)) { return error }
+    guard let wid = (args["windowId"] as? NSNumber)?.uint32Value else { return fail("需要窗口标识", code: "STALE_WINDOW") }
+    let count = (args["clickCount"] as? Int) ?? 1
+    guard (args["button"] as? String ?? "left") == "left", count == 1 || count == 2 else {
+        return fail("后台坐标路径仅支持左键单击或双击", code: "BACKGROUND_UNSUPPORTED")
+    }
+    typealias Connection = @convention(c) () -> UInt32
+    typealias Owner = @convention(c) (UInt32, UInt32, UnsafeMutablePointer<UInt32>) -> Int32
+    typealias PSN = @convention(c) (UInt32, UnsafeMutableRawPointer) -> Int32
+    typealias Record = @convention(c) (UnsafeRawPointer, UnsafeRawPointer) -> Int32
+    typealias Post = @convention(c) (pid_t, CGEvent) -> Void
+    typealias Field = @convention(c) (CGEvent, UInt32, Int64) -> Void
+    typealias Location = @convention(c) (CGEvent, Double, Double) -> Void
+    guard let connection = pointerSymbol("CGSMainConnectionID", as: Connection.self),
+          let owner = pointerSymbol("SLSGetWindowOwner", as: Owner.self),
+          let psn = pointerSymbol("SLSGetConnectionPSN", as: PSN.self),
+          let record = pointerSymbol("SLPSPostEventRecordTo", as: Record.self),
+          let post = pointerSymbol("SLEventPostToPid", as: Post.self),
+          let field = pointerSymbol("SLEventSetIntegerValueField", as: Field.self),
+          let location = pointerSymbol("CGEventSetWindowLocation", as: Location.self) else {
+        return fail("此系统不提供后台窗口输入接口", code: "BACKGROUND_UNAVAILABLE")
+    }
+    var cid: UInt32 = 0
+    var targetPSN = [UInt32](repeating: 0, count: 2)
+    guard owner(connection(), wid, &cid) == 0,
+          targetPSN.withUnsafeMutableBytes({ psn(cid, $0.baseAddress!) }) == 0 else {
+        return fail("无法解析窗口所属进程", code: "BACKGROUND_UNAVAILABLE")
+    }
+    // Construct every event before preparing focus so allocation failures have no input effects.
+    var steps: [(CGEventType, CGPoint, Int64, Int64, useconds_t)] = [
+        (.mouseMoved, CGPoint(x: x, y: y), 2, 0, 15_000),
+        (.leftMouseDown, CGPoint(x: -1, y: -1), 1, 1, 1_000),
+        (.leftMouseUp, CGPoint(x: -1, y: -1), 2, 1, 100_000),
+    ]
+    for n in 1...count {
+        steps.append((.leftMouseDown, CGPoint(x: x, y: y), 3, Int64(n), 1_000))
+        steps.append((.leftMouseUp, CGPoint(x: x, y: y), 3, Int64(n), n < count ? 80_000 : 0))
+    }
+    let source = CGEventSource(stateID: .hidSystemState)
+    let group = Int64(DispatchTime.now().uptimeNanoseconds & 0x7fffffff)
+    var events: [(CGEvent, useconds_t)] = []
+    for (kind, point, phase, clicks, delay) in steps {
+        guard let event = CGEvent(mouseEventSource: source, mouseType: kind, mouseCursorPosition: point, mouseButton: .left) else {
+            return fail("无法创建点击事件", code: "INPUT_CREATION_FAILED")
+        }
+        for (key, value): (UInt32, Int64) in [(0, phase), (1, clicks), (3, 0), (7, 3), (40, Int64(pid)), (51, Int64(wid)), (91, Int64(wid)), (92, Int64(wid)), (58, group)] {
+            field(event, key, value)
+        }
+        location(event, point.x, point.y)
+        event.flags = []
+        events.append((event, delay))
+    }
+    var buffer = [UInt8](repeating: 0, count: 0xF8)
+    buffer[4] = 0xF8; buffer[8] = 0x0D; buffer[0x8A] = 1
+    for i in 0..<4 { buffer[0x3C + i] = UInt8((wid >> (8 * i)) & 0xff) }
+    let status = targetPSN.withUnsafeBytes { target in buffer.withUnsafeBytes { record(target.baseAddress!, $0.baseAddress!) } }
+    guard status == 0 else {
+        return fail("窗口焦点准备结果不确定；请观察后再决定是否重试", code: "INPUT_OUTCOME_UNKNOWN")
+    }
+    usleep(50_000)
+    for (event, delay) in events { post(pid, event); if delay > 0 { usleep(delay) } }
+    return ok(["dispatched": true, "verified": false, "via": "window-routed", "windowId": wid])
+}
+
 func click(_ args: [String: Any]) -> [String: Any] {
     if let axErr = requireAX() { return axErr }
     let x: Double
@@ -288,6 +406,7 @@ func click(_ args: [String: Any]) -> [String: Any] {
     let buttonName = (args["button"] as? String) ?? "left"
     let button: CGMouseButton = buttonName == "right" ? .right : (buttonName == "middle" ? .center : .left)
     let pid = targetPid(args)
+    if let pid { return backgroundClick(args, pid: pid, x: x, y: y) }
     let point = CGPoint(x: x, y: y)
     if pid == nil {
         moveMouse(x, y)
@@ -302,20 +421,52 @@ func click(_ args: [String: Any]) -> [String: Any] {
     return ok()
 }
 
+/// Send keys to the exact observed, already-focused app window; never changes WindowServer key focus.
+func backgroundKeys(_ args: [String: Any], pid: pid_t, events: [CGEvent]) -> [String: Any] {
+    if let error = validateBackgroundWindow(args, pid: pid) { return error }
+    typealias Number = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    typealias Post = @convention(c) (pid_t, CGEvent) -> Void
+    typealias Field = @convention(c) (CGEvent, UInt32, Int64) -> Void
+    guard let wid = (args["windowId"] as? NSNumber)?.uint32Value,
+          let number = pointerSymbol("_AXUIElementGetWindow", as: Number.self),
+          let post = pointerSymbol("SLEventPostToPid", as: Post.self),
+          let field = pointerSymbol("SLEventSetIntegerValueField", as: Field.self) else {
+        return fail("后台键盘接口不可用", code: "BACKGROUND_UNAVAILABLE")
+    }
+    var focused: CFTypeRef?
+    var focusedID: CGWindowID = 0
+    guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute as CFString, &focused) == .success,
+          let focused, CFGetTypeID(focused) == AXUIElementGetTypeID(),
+          number(unsafeBitCast(focused, to: AXUIElement.self), &focusedID) == .success, focusedID == wid else {
+        return fail("目标窗口没有应用内键盘焦点，请先点击目标输入框并重新观察", code: "WINDOW_NOT_FOCUSED")
+    }
+    // No authentication envelope or global HID post: retain the PID/window-directed route.
+    for event in events {
+        field(event, 40, Int64(pid))
+        field(event, 51, Int64(wid))
+        post(pid, event)
+        usleep(30_000)
+    }
+    return ok(["dispatched": true, "verified": false, "via": "window-keyboard", "windowId": wid])
+}
+
 func typeText(_ args: [String: Any]) -> [String: Any] {
     if let axErr = requireAX() { return axErr }
     guard let text = args["text"] as? String else { return fail("type 需要 text") }
-    let pid = targetPid(args)
-    for scalar in text.unicodeScalars {
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true) else { continue }
-        var code = UInt16(scalar.value)
-        down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &code)
-        post(down, to: pid)
-        guard let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { continue }
-        up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &code)
-        post(up, to: pid)
-        usleep(20_000)
+    var events: [CGEvent] = []
+    for character in text {
+        let units = Array(String(character).utf16)
+        for down in [true, false] {
+            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else {
+                return fail("无法创建键盘事件", code: "INPUT_CREATION_FAILED")
+            }
+            units.withUnsafeBufferPointer { event.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress!) }
+            event.flags = []
+            events.append(event)
+        }
     }
+    if let pid = targetPid(args) { return backgroundKeys(args, pid: pid, events: events) }
+    for event in events { post(event) }
     return ok()
 }
 
@@ -364,16 +515,13 @@ func pressKey(_ args: [String: Any]) -> [String: Any] {
     }
     let code: CGKeyCode
     if let v = KEYCODES[keyName] { code = v } else { return fail("不支持的按键: \(chord)") }
-    let pid = targetPid(args)
-    if let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true) {
-        down.flags = flags
-        post(down, to: pid)
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else {
+        return fail("无法创建键盘事件", code: "INPUT_CREATION_FAILED")
     }
-    usleep(40_000)
-    if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
-        up.flags = flags
-        post(up, to: pid)
-    }
+    down.flags = flags; up.flags = flags
+    if let pid = targetPid(args) { return backgroundKeys(args, pid: pid, events: [down, up]) }
+    post(down); post(up)
     return ok()
 }
 
@@ -600,53 +748,24 @@ func appMatches(_ app: NSRunningApplication, _ query: String) -> Bool {
 
 func openApp(_ args: [String: Any]) -> [String: Any] {
     guard let query = args["query"] as? String, !query.isEmpty else { return fail("openapp 需要 query") }
+    let background = args["background"] as? Bool ?? false
     let ws = NSWorkspace.shared
-
-    if query.contains(".") {
-        if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
-            app.activate(options: [.activateAllWindows])
-            return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
-        }
-        if let url = ws.urlForApplication(withBundleIdentifier: query),
-           ws.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) != nil {
-            usleep(900_000)
-            let app = ws.runningApplications.first(where: { appMatches($0, query) })
-            return ok(["pid": app?.processIdentifier ?? 0, "name": app?.localizedName ?? query, "activated": false])
-        }
-        return fail("无法启动应用 bundleId: \(query)", code: "APP_LAUNCH_FAILED")
-    }
-
     if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
-        app.activate(options: [.activateAllWindows])
-        return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
+        if !background { app.activate(options: [.activateAllWindows]) }
+        return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": !background])
     }
-
-    // Launch by name via LaunchServices (`open -a`), which activates the app.
-    let openProc = Process()
-    openProc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    openProc.arguments = ["-a", query]
-    try? openProc.run()
-    openProc.waitUntilExit()
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    let selector = ws.urlForApplication(withBundleIdentifier: query) != nil ? "-b" : "-a"
+    process.arguments = (background ? ["-g"] : []) + [selector, query]
+    do { try process.run() } catch { return fail("无法启动应用: \(error)", code: "APP_LAUNCH_FAILED") }
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else { return fail("无法启动应用: \(query)", code: "APP_LAUNCH_FAILED") }
     usleep(900_000)
-    if let app = ws.runningApplications.first(where: { appMatches($0, query) }) {
-        app.activate(options: [.activateAllWindows])
-        return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": true])
+    guard let app = ws.runningApplications.first(where: { appMatches($0, query) }) else {
+        return fail("应用启动后尚未可用，请重新观察", code: "APP_NOT_READY")
     }
-
-    let dirs = ["/Applications", NSString("~/Applications").expandingTildeInPath, "/System/Applications"]
-    for dir in dirs {
-        if let apps = try? FileManager.default.contentsOfDirectory(atPath: dir) {
-            if let hit = apps.first(where: { $0.lowercased().hasPrefix(query.lowercased()) && $0.hasSuffix(".app") }) {
-                let url = URL(fileURLWithPath: dir + "/" + hit)
-                if ws.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) != nil {
-                    usleep(900_000)
-                    let app = ws.runningApplications.first(where: { ($0.localizedName ?? "").lowercased() == query.lowercased() })
-                    return ok(["pid": app?.processIdentifier ?? 0, "name": String(hit.dropLast(4)), "activated": false])
-                }
-            }
-        }
-    }
-    return fail("未找到应用: \(query)", code: "APP_NOT_FOUND")
+    return ok(["pid": app.processIdentifier, "name": app.localizedName ?? query, "activated": !background])
 }
 
 func activateApp(_ args: [String: Any]) -> [String: Any] {
@@ -665,7 +784,9 @@ func activateApp(_ args: [String: Any]) -> [String: Any] {
 func runMain(_ command: String, _ parsed: [String: Any]) -> [String: Any] {
     switch command {
     case "permissions":
-        return ok(checkPermissions())
+        var result = ok(checkPermissions())
+        result["backgroundProtocol"] = 2
+        return result
     case "requestpermissions":
         return requestPermissions()
     case "screenshot":
